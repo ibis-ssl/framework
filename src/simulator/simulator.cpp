@@ -24,6 +24,7 @@
 #include <QNetworkDatagram>
 #include <QCommandLineParser>
 #include <QTime>
+#include <QTimer>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
@@ -896,13 +897,19 @@ private:
 class IbisFeedbackAdaptor : public QObject {
     Q_OBJECT
 public:
-    IbisFeedbackAdaptor(const QHostAddress& addr, quint16 portBase, bool useReferee)
+    IbisFeedbackAdaptor(const QHostAddress& addr, quint16 portBase, bool useReferee, int feedbackHz = 125)
         : m_sender(new PacketSenderThread())
         , m_addr(addr)
         , m_portBase(portBase)
         , m_ibisIsBlue(true)
         , m_refereeResolved(!useReferee)
     {
+        // タイマー駆動のフィードバック送信（指定レートで定期送信）
+        m_feedbackTimer = new QTimer(this);
+        m_feedbackTimer->setTimerType(Qt::PreciseTimer);
+        m_feedbackTimer->setInterval(1000 / feedbackHz);
+        connect(m_feedbackTimer, &QTimer::timeout, this, &IbisFeedbackAdaptor::onFeedbackTimer);
+        m_feedbackTimer->start();
     }
 
     ~IbisFeedbackAdaptor() override {
@@ -955,28 +962,13 @@ public slots:
             const IbisVisionState& vis = m_vision[teamIdx][id];
             if (!vis.valid) { continue; }
 
-            // Rotate robot-local velocity (v_f=forward, v_s=left) to global SSL coords.
+            // ロボットローカル速度（v_f=前方, v_s=左）をグローバルSSL座標に変換してキャッシュ
             const float theta = vis.orientation_rad;
             const float v_f = resp.estimated_speed().v_f();
             const float v_s = resp.estimated_speed().v_s();
-            const float vel_x = v_f * std::cos(theta) - v_s * std::sin(theta);
-            const float vel_y = v_f * std::sin(theta) + v_s * std::cos(theta);
-
-            uint8_t buffer[IBIS_FEEDBACK_SIZE];
-            ibisBuildFeedbackPacket(
-                buffer,
-                static_cast<int>(id),
-                m_counters[id]++,
-                vis.orientation_rad,
-                resp.has_ball_detected() && resp.ball_detected(),
-                0, // kick_status not tracked in ER-Force simulator
-                vis.x_mm / 1000.0f,
-                vis.y_mm / 1000.0f,
-                vel_x, vel_y);
-
-            m_sender->enqueue(
-                QByteArray(reinterpret_cast<const char*>(buffer), IBIS_FEEDBACK_SIZE),
-                m_addr, m_portBase + static_cast<quint16>(id));
+            m_robotCache[id].vel_x = v_f * std::cos(theta) - v_s * std::sin(theta);
+            m_robotCache[id].vel_y = v_f * std::sin(theta) + v_s * std::cos(theta);
+            m_robotCache[id].ball_detected = resp.has_ball_detected() && resp.ball_detected();
         }
     }
 
@@ -989,14 +981,49 @@ public slots:
         }
     }
 
+private slots:
+    // タイマー発火時にキャッシュデータを使ってフィードバックを送信
+    void onFeedbackTimer() {
+        if (!m_refereeResolved) { return; }
+        const int teamIdx = m_ibisIsBlue ? 0 : 1;
+        for (uint32_t id = 0; id < kMaxRobots; ++id) {
+            const IbisVisionState& vis = m_vision[teamIdx][id];
+            if (!vis.valid) { continue; }
+
+            uint8_t buffer[IBIS_FEEDBACK_SIZE];
+            ibisBuildFeedbackPacket(
+                buffer,
+                static_cast<int>(id),
+                m_counters[id]++,
+                vis.orientation_rad,
+                m_robotCache[id].ball_detected,
+                0, // kick_status not tracked in ER-Force simulator
+                vis.x_mm / 1000.0f,
+                vis.y_mm / 1000.0f,
+                m_robotCache[id].vel_x, m_robotCache[id].vel_y);
+
+            m_sender->enqueue(
+                QByteArray(reinterpret_cast<const char*>(buffer), IBIS_FEEDBACK_SIZE),
+                m_addr, m_portBase + static_cast<quint16>(id));
+        }
+    }
+
 private:
     static constexpr uint32_t kMaxRobots = 16;
 
+    struct RobotCache {
+        float vel_x = 0.0f;
+        float vel_y = 0.0f;
+        bool ball_detected = false;
+    };
+
     // m_vision[0] = blue, m_vision[1] = yellow
     IbisVisionState m_vision[2][kMaxRobots] = {};
+    RobotCache      m_robotCache[kMaxRobots] = {};
     uint8_t         m_counters[kMaxRobots]  = {};
     int             m_waitLogCount          = 0;
 
+    QTimer*             m_feedbackTimer;
     PacketSenderThread* m_sender;
     QHostAddress        m_addr;
     quint16             m_portBase;
@@ -1043,6 +1070,7 @@ int main(int argc, char* argv[])
     QCommandLineOption ibisUseRefereeOpt("ibis-use-referee", "Use Game Controller referee to auto-detect ibis team color");
     QCommandLineOption ibisAccSpeedupOpt("ibis-acc-speedup", "Acceleration limit for speedup [m/s^2]", "accel", "4.0");
     QCommandLineOption ibisAccBrakeOpt("ibis-acc-brake", "Acceleration limit for braking [m/s^2]", "accel", "6.0");
+    QCommandLineOption ibisFeedbackHzOpt("ibis-feedback-hz", "ibis feedback send rate in Hz (default: 125)", "hz", "125");
     parser.addOption(ibisPortOpt);
     parser.addOption(ibisFeedbackAddrOpt);
     parser.addOption(ibisFeedbackPortBaseOpt);
@@ -1050,6 +1078,7 @@ int main(int argc, char* argv[])
     parser.addOption(ibisUseRefereeOpt);
     parser.addOption(ibisAccSpeedupOpt);
     parser.addOption(ibisAccBrakeOpt);
+    parser.addOption(ibisFeedbackHzOpt);
 
     parser.process(app);
 
@@ -1130,9 +1159,10 @@ int main(int argc, char* argv[])
         const QHostAddress fbAddr   = QHostAddress(parser.value(ibisFeedbackAddrOpt));
         const quint16 fbPortBase    = static_cast<quint16>(parser.value(ibisFeedbackPortBaseOpt).toUInt());
         const bool useReferee       = parser.isSet(ibisUseRefereeOpt);
+        const int feedbackHz        = qMax(1, parser.value(ibisFeedbackHzOpt).toInt());
 
         auto* ibisCmd = new IbisCommandAdaptor(cmdPort, &timer, accSpeedup, accBrake);
-        auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee);
+        auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee, feedbackHz);
 
         // IbisCommandAdaptor receives vision data to cache robot positions/orientations
         QObject::connect(&sim, &SimProxy::gotPacket,
@@ -1161,9 +1191,9 @@ int main(int argc, char* argv[])
         ibisFb->moveToThread(&rcv_thread);
 
         log(stdout, "ibis: command receiver on UDP port %d\n", cmdPort);
-        log(stdout, "ibis: feedback sender to %s base port %d\n",
+        log(stdout, "ibis: feedback sender to %s base port %d at %d Hz\n",
             parser.value(ibisFeedbackAddrOpt).toStdString().c_str(),
-            static_cast<int>(fbPortBase));
+            static_cast<int>(fbPortBase), feedbackHz);
     }
 
     rcv_thread.start();
