@@ -20,6 +20,7 @@
 add_executable(simulator-cli WIN32 MACOSX_BUNDLE
     simulator.cpp
     ssl_robocup_server.cpp
+    packet_sender_thread.cpp
 )
 
 target_link_libraries(simulator-cli
