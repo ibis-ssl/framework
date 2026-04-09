@@ -274,6 +274,21 @@ void Simulator::process()
     m_data->dynamicsWorld->stepSimulation(timeDelta, 10, SUB_TIMESTEP);
     m_time = current_time;
 
+    // Emit ground truth robot positions at full simulation rate (200Hz), without noise
+    {
+        world::SimulatorState gt;
+        gt.set_time(m_time);
+        for (auto it = m_data->robotsBlue.cbegin(); it != m_data->robotsBlue.cend(); ++it) {
+            it.value().first->update(gt.add_blue_robots(), m_data->ball);
+        }
+        for (auto it = m_data->robotsYellow.cbegin(); it != m_data->robotsYellow.cend(); ++it) {
+            it.value().first->update(gt.add_yellow_robots(), m_data->ball);
+        }
+        QByteArray gtData(static_cast<int>(gt.ByteSizeLong()), 0);
+        gt.SerializeToArray(gtData.data(), gtData.size());
+        emit sendGroundTruth(gtData);
+    }
+
     // only send a vision packet every third frame = 15 ms - epsilon (=half frame)
     // gives a vision frequency of 66.67Hz
     if (m_lastSentStatusTime + 12500000 <= m_time) {

@@ -52,6 +52,7 @@
 
 #include "protobuf/ssl_vision/ssl_wrapper.pb.h"
 #include "protobuf/ssl_gc/state/ssl_gc_referee_message.pb.h"
+#include "protobuf/world.pb.h"
 
 /**
  * Stand alone Erforce simulator
@@ -598,6 +599,7 @@ signals:
     void sendSSLSimError(const QList<SSLSimError>& errors, ErrorSource source); // out
     void sendRadioResponses(const QList<robot::RadioResponse> &responses); // out
     void gotPacket(const QByteArray &data, qint64 time, QString sender); // out
+    void sendGroundTruth(const QByteArray& data); // out - world::SimulatorState at 200Hz
     void gotCommand(const Command &command); // internal
     void handleRadioCommands(const SSLSimRobotControl& control, bool isBlue, qint64 processingStart); // in
 public slots:
@@ -643,6 +645,7 @@ void SimProxy::handleCommand(const Command &command) {
         connect(this, &SimProxy::handleRadioCommands, m_sim, &Simulator::handleRadioCommands);
         connect(m_sim, &Simulator::sendSSLSimError, this, &SimProxy::sendSSLSimError);
         connect(m_sim, &Simulator::sendRadioResponses, this, &SimProxy::sendRadioResponses);
+        connect(m_sim, &Simulator::sendGroundTruth, this, &SimProxy::sendGroundTruth);
         auto* simCommand = m_teamCommand->mutable_simulator();
         simCommand->set_enable(true);
         auto* trCommand = m_teamCommand->mutable_transceiver();
@@ -853,12 +856,12 @@ private:
 class RefereeTeamDetector : public QObject {
     Q_OBJECT
 public:
-    RefereeTeamDetector(const QString& teamName, bool localhost)
+    RefereeTeamDetector(const QString& teamName, bool localhost, quint16 port = SSL_GAME_CONTROLLER_PORT)
         : m_socket(this)
         , m_teamName(teamName.toLower().trimmed())
     {
         m_socket.bind(QHostAddress::AnyIPv4,
-                      SSL_GAME_CONTROLLER_PORT,
+                      port,
                       QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
         if (!localhost) {
             m_socket.joinMulticastGroup(QHostAddress(SSL_GAME_CONTROLLER_ADDRESS));
@@ -919,30 +922,35 @@ public:
     }
 
 public slots:
-    void handleVisionData(const QByteArray& data, qint64, QString) {
-        SSL_WrapperPacket pkt;
-        if (!pkt.ParseFromArray(data.data(), data.size()) || !pkt.has_detection()) {
+    // world::SimulatorState から IbisVisionState を更新する（200Hz）
+    // world::SimRobot の座標系: p_x/p_y はゲーム座標系のメートル単位（Bullet座標 / SIMULATOR_SCALE）
+    // SSL座標系への変換: x_mm = p_y * 1000, y_mm = -p_x * 1000
+    // 方向角: クォータニオン (i,j,k,real) の回転行列第1列から yaw を算出
+    void handleGroundTruth(const QByteArray& data) {
+        world::SimulatorState state;
+        if (!state.ParseFromArray(data.data(), data.size())) {
             return;
         }
-        const auto& det = pkt.detection();
-        for (const auto& r : det.robots_blue()) {
-            if (!r.has_robot_id()) { continue; }
-            const uint32_t id = r.robot_id();
-            if (id < kMaxRobots) {
-                m_vision[0][id] = {r.x(), r.y(),
-                                   r.has_orientation() ? r.orientation() : 0.0f,
-                                   true};
+        auto updateTeam = [this](const auto& robots, int teamIdx) {
+            for (const auto& r : robots) {
+                const uint32_t id = r.id();
+                if (id >= kMaxRobots) { continue; }
+                const float qx = r.rotation().i();
+                const float qy = r.rotation().j();
+                const float qz = r.rotation().k();
+                const float qw = r.rotation().real();
+                const float dir_x = 1.0f - 2.0f * (qy*qy + qz*qz);
+                const float dir_y = 2.0f * (qx*qy + qw*qz);
+                m_vision[teamIdx][id] = {
+                    r.p_y() * 1000.0f,
+                    -r.p_x() * 1000.0f,
+                    std::atan2(dir_y, dir_x),
+                    true
+                };
             }
-        }
-        for (const auto& r : det.robots_yellow()) {
-            if (!r.has_robot_id()) { continue; }
-            const uint32_t id = r.robot_id();
-            if (id < kMaxRobots) {
-                m_vision[1][id] = {r.x(), r.y(),
-                                   r.has_orientation() ? r.orientation() : 0.0f,
-                                   true};
-            }
-        }
+        };
+        updateTeam(state.blue_robots(),   0);
+        updateTeam(state.yellow_robots(), 1);
     }
 
     void handleRobotResponse(const QList<robot::RadioResponse>& responses) {
@@ -1071,6 +1079,7 @@ int main(int argc, char* argv[])
     QCommandLineOption ibisAccSpeedupOpt("ibis-acc-speedup", "Acceleration limit for speedup [m/s^2]", "accel", "4.0");
     QCommandLineOption ibisAccBrakeOpt("ibis-acc-brake", "Acceleration limit for braking [m/s^2]", "accel", "6.0");
     QCommandLineOption ibisFeedbackHzOpt("ibis-feedback-hz", "ibis feedback send rate in Hz (default: 125)", "hz", "125");
+    QCommandLineOption ibisRefereePortOpt("ibis-referee-port", "Game Controller multicast port for team color detection", "port", QString::number(SSL_GAME_CONTROLLER_PORT));
     parser.addOption(ibisPortOpt);
     parser.addOption(ibisFeedbackAddrOpt);
     parser.addOption(ibisFeedbackPortBaseOpt);
@@ -1079,6 +1088,7 @@ int main(int argc, char* argv[])
     parser.addOption(ibisAccSpeedupOpt);
     parser.addOption(ibisAccBrakeOpt);
     parser.addOption(ibisFeedbackHzOpt);
+    parser.addOption(ibisRefereePortOpt);
 
     parser.process(app);
 
@@ -1160,6 +1170,7 @@ int main(int argc, char* argv[])
         const quint16 fbPortBase    = static_cast<quint16>(parser.value(ibisFeedbackPortBaseOpt).toUInt());
         const bool useReferee       = parser.isSet(ibisUseRefereeOpt);
         const int feedbackHz        = qMax(1, parser.value(ibisFeedbackHzOpt).toInt());
+        const quint16 refereePort   = static_cast<quint16>(parser.value(ibisRefereePortOpt).toUInt());
 
         auto* ibisCmd = new IbisCommandAdaptor(cmdPort, &timer, accSpeedup, accBrake);
         auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee, feedbackHz);
@@ -1171,9 +1182,9 @@ int main(int argc, char* argv[])
         QObject::connect(ibisCmd, &IbisCommandAdaptor::sendRadioCommands,
                          &sim, &SimProxy::handleRadioCommands);
 
-        // IbisFeedbackAdaptor receives vision data for position/orientation
-        QObject::connect(&sim, &SimProxy::gotPacket,
-                         ibisFb, &IbisFeedbackAdaptor::handleVisionData);
+        // IbisFeedbackAdaptor receives ground truth positions at 200Hz for position/orientation
+        QObject::connect(&sim, &SimProxy::sendGroundTruth,
+                         ibisFb, &IbisFeedbackAdaptor::handleGroundTruth);
         // IbisFeedbackAdaptor receives radio responses for velocity and ball detection
         QObject::connect(&sim, &SimProxy::sendRadioResponses,
                          ibisFb, &IbisFeedbackAdaptor::handleRobotResponse);
@@ -1181,7 +1192,8 @@ int main(int argc, char* argv[])
         if (useReferee) {
             auto* referee = new RefereeTeamDetector(
                 parser.value(ibisFeedbackTeamNameOpt),
-                parser.isSet(localhostConfig));
+                parser.isSet(localhostConfig),
+                refereePort);
             QObject::connect(referee, &RefereeTeamDetector::teamDetected,
                              ibisFb, &IbisFeedbackAdaptor::handleRefereePacket);
             referee->moveToThread(&rcv_thread);

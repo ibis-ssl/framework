@@ -78,6 +78,7 @@ signals:
     void sendStatus(const Status &status);
     void sendRadioResponses(const QList<robot::RadioResponse> &responses);
     void sendRealData(const QByteArray& data); // sends amun::SimulatorState
+    void sendGroundTruth(const QByteArray& data); // sends world::SimulatorState at 200Hz, no noise
     void sendSSLSimError(const QList<SSLSimError>& errors, ErrorSource source);
 
 public slots:
