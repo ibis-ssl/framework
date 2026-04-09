@@ -965,8 +965,8 @@ void Simulator::setScaling(double scaling)
         // clear pending vision packets
         resetVisionPackets();
     } else {
-        // scale default timing of 5 milliseconds
-        const int t = 5 / scaling;
+        // scale default timing of 4 milliseconds (250Hz, multiple of ibis feedback 125Hz)
+        const int t = 4 / scaling;
         m_trigger->start(qMax(1, t));
 
         // The vision packet timings are wrong after a scaling change

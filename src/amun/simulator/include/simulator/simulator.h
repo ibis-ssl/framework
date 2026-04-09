@@ -35,7 +35,7 @@
 
 // higher values break the rolling friction of the ball
 const float SIMULATOR_SCALE = 10.0f;
-const float SUB_TIMESTEP = 1/200.f;
+const float SUB_TIMESTEP = 1/250.f;
 const float COLLISION_MARGIN = 0.04f;
 const unsigned FOCAL_LENGTH = 390;
 
