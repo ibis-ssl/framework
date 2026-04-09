@@ -222,6 +222,8 @@ find_package(V8 10.5.7)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_subdirectory(src)
 
+install(DIRECTORY config/ DESTINATION config FILES_MATCHING PATTERN "*.txt")
+
 if(UNIX AND NOT APPLE)
     configure_file(data/pkg/ra.desktop.in ra.desktop)
     configure_file(data/pkg/ra-logplayer.desktop.in ra-logplayer.desktop)

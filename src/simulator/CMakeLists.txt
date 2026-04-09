@@ -30,3 +30,5 @@ target_link_libraries(simulator-cli
     Qt6::Widgets
     amun::simulator
 )
+
+install(TARGETS simulator-cli RUNTIME DESTINATION bin)

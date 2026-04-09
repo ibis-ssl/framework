@@ -16,6 +16,5 @@
 /strategy
 /data
 !/data/pkg
-!/data/docker/simulatorcli_entrypoint.bash
 
 # vim: filetype=gitignore
