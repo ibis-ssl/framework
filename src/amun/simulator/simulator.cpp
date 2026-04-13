@@ -118,7 +118,7 @@ Simulator::Simulator(const Timer *timer, const amun::SimulatorSetup &setup, bool
     m_isPartial(useManualTrigger),
     m_timer(timer),
     m_time(0),
-    m_lastSentStatusTime(0),
+    m_simulationFrameCounter(0),
     m_timeScaling(1.),
     m_enabled(false),
     m_charge(false),
@@ -126,7 +126,7 @@ Simulator::Simulator(const Timer *timer, const amun::SimulatorSetup &setup, bool
     m_visionProcessingTime(5 * 1000 * 1000),
     m_aggregator(new ErrorAggregator(this))
 {
-    // triggers by default every 5 milliseconds if simulator is enabled
+    // triggers by default every 8 milliseconds if simulator is enabled
     // timing may change if time is scaled
     m_trigger = new QTimer(this);
     m_trigger->setTimerType(Qt::PreciseTimer);
@@ -274,7 +274,7 @@ void Simulator::process()
     m_data->dynamicsWorld->stepSimulation(timeDelta, 10, SUB_TIMESTEP);
     m_time = current_time;
 
-    // Emit ground truth robot positions at full simulation rate (200Hz), without noise
+    // Emit ground truth robot positions at full simulation rate (125Hz), without noise
     {
         world::SimulatorState gt;
         gt.set_time(m_time);
@@ -289,9 +289,9 @@ void Simulator::process()
         emit sendGroundTruth(gtData);
     }
 
-    // only send a vision packet every third frame = 15 ms - epsilon (=half frame)
-    // gives a vision frequency of 66.67Hz
-    if (m_lastSentStatusTime + 12500000 <= m_time) {
+    // send a vision packet every second simulation frame
+    // with the 125 Hz base loop this results in an effective vision frequency of 62.5 Hz
+    if ((m_simulationFrameCounter++ % 2) == 0) {
         auto data = createVisionPacket();
 
 
@@ -312,8 +312,6 @@ void Simulator::process()
             timer->start(timeout);
             m_visionTimers.enqueue(timer);
         }
-
-        m_lastSentStatusTime = m_time;
     }
 
     // send timing information
@@ -800,6 +798,7 @@ void Simulator::handleCommand(const Command &command)
         if (sim.has_enable()) {
             m_enabled = sim.enable();
             m_time = m_timer->currentTime();
+            m_simulationFrameCounter = 0;
             // update timer when simulator status is changed
             setScaling(m_timeScaling);
         }
@@ -965,8 +964,8 @@ void Simulator::setScaling(double scaling)
         // clear pending vision packets
         resetVisionPackets();
     } else {
-        // scale default timing of 4 milliseconds (250Hz, multiple of ibis feedback 125Hz)
-        const int t = 4 / scaling;
+        // scale default timing of 8 milliseconds (125Hz)
+        const int t = 8 / scaling;
         m_trigger->start(qMax(1, t));
 
         // The vision packet timings are wrong after a scaling change
