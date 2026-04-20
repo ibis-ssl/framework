@@ -1059,7 +1059,7 @@ int main(int argc, char* argv[])
     parser.addHelpOption();
 
     QCommandLineOption geometryConfig({"g", "geometry"}, "The geometry file to load as default", "file", "2020");
-    QCommandLineOption realismConfig("realism", "Simulator realism configuration (short file name without the .txt)", "realism", "Realistic");
+    QCommandLineOption realismConfig("realism", "Simulator realism configuration (short file name without the .txt)", "realism", "Ibis");
     QCommandLineOption localhostConfig("localhost", "Use localhost as the output address for the simulator");
     parser.addOption(geometryConfig);
     parser.addOption(realismConfig);

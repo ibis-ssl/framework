@@ -113,6 +113,7 @@ private:
     float error_sum_omega;
 
     bool m_perfectDribbler = false;
+    double m_dribblerReleaseCooldown = 0.0;
     float m_rotationError = 0.0f;
 
     qint64 m_lastSendTime = 0;
