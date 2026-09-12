@@ -57,6 +57,26 @@ The `simulator-cli` takes three command line arguments:
 A `short_file_name` is just the filename without the path or the extension.
 For example, to start the binary with no realism and 2018 setup, call `simulator-cli -g 2018 --realism None`
 
+#### Robot-side position control (ibis)
+
+The ibis command receiver emulates the robot's STM32 (G474) main board: it
+accepts `POLAR_VELOCITY_TARGET` (control mode 3) only and does **not** close a
+position loop. In the robot-side position control setup, `crane` sends
+`POSITION_TARGET` (mode 4) commands that are consumed by the CM4 position
+controller (`cm4_sim`) running between `crane` and the simulator:
+
+```text
+crane --mode 4--> cm4_sim --mode 3--> simulator-cli
+                     ^                     |
+                     +--- ibis feedback ---+
+```
+
+A mode 4 command arriving directly at the simulator means `cm4_sim` is missing
+from the chain; the simulator stops that robot and logs why instead of
+misreading the mode arguments. See
+[docs/robot-side-position-control.md](docs/robot-side-position-control.md) for
+the packet contract and port assignment.
+
 ### Other utilities
 This repo also contains various utilities:
 - `amun-cli` - run an AI script from the command line.

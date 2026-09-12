@@ -721,6 +721,10 @@ private slots:
                 }
 
                 const uint8_t* cmd_data = buf + offset + 1;
+                // Senders zero-fill the slots of robots they do not control.
+                if (ibisSlotIsEmpty(cmd_data)) {
+                    continue;
+                }
                 if (cmd_data[CHECK_COUNTER] == m_robotStates[robot_id].last_check_counter) {
                     continue;
                 }
@@ -754,6 +758,20 @@ private slots:
                 robotCmd->set_id(robot_id);
 
                 if (cmd.stop_emergency) {
+                    auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
+                    lv->set_forward(0.0f);
+                    lv->set_left(0.0f);
+                    lv->set_angular(0.0f);
+                    m_robotStates[robot_id].prev_vx = 0.0;
+                    m_robotStates[robot_id].prev_vy = 0.0;
+                } else if (cmd.control_mode != IBIS_MODE_POLAR_VELOCITY_TARGET) {
+                    // This adaptor emulates the robot's STM32 (G474) main board, which
+                    // implements POLAR_VELOCITY_TARGET only. Any other mode means the
+                    // chain is misconfigured -- most likely a POSITION_TARGET command
+                    // that should have been consumed by the robot-side position loop
+                    // (cm4_sim) before reaching the simulator. Hold the robot still and
+                    // say why, rather than steering on reinterpreted mode args.
+                    warnUnsupportedMode(robot_id, cmd.control_mode);
                     auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
                     lv->set_forward(0.0f);
                     lv->set_left(0.0f);
@@ -837,12 +855,41 @@ private slots:
     }
 
 private:
+    // Logs at most once per second per robot, so a persistently misconfigured
+    // chain produces a readable hint instead of a flood at the command rate.
+    void warnUnsupportedMode(int robot_id, uint8_t mode) {
+        constexpr qint64 kWarnIntervalNs = 1000LL * 1000LL * 1000LL;
+        auto& state = m_robotStates[robot_id];
+        const qint64 now = m_timer->currentTime();
+        if (state.mode_warned && now - state.last_mode_warn_ns < kWarnIntervalNs) {
+            return;
+        }
+        state.mode_warned = true;
+        state.last_mode_warn_ns = now;
+        if (mode == IBIS_MODE_POSITION_TARGET) {
+            log(stdout,
+                "ibis: robot %d sent POSITION_TARGET (mode %u), robot stopped. The simulator "
+                "emulates the STM32 main board and does not close a position loop -- run the "
+                "CM4 position controller (cm4_sim) between crane and the simulator. "
+                "See docs/robot-side-position-control.md\n",
+                robot_id, static_cast<unsigned>(mode));
+        } else {
+            log(stdout,
+                "ibis: robot %d sent unsupported control mode %u, robot stopped "
+                "(expected POLAR_VELOCITY_TARGET = %u)\n",
+                robot_id, static_cast<unsigned>(mode),
+                static_cast<unsigned>(IBIS_MODE_POLAR_VELOCITY_TARGET));
+        }
+    }
+
     static constexpr uint32_t kMaxRobots = 16;
 
     struct PerRobotState {
         double  prev_vx            = 0.0;
         double  prev_vy            = 0.0;
         uint8_t last_check_counter = 0xFF;
+        qint64  last_mode_warn_ns  = 0;
+        bool    mode_warned        = false;
     };
 
     // m_vision[0] = blue, m_vision[1] = yellow
