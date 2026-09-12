@@ -193,21 +193,28 @@ inline bool ibisSlotIsEmpty(const uint8_t* d)
 //
 // Parameters:
 //   buffer          - 128-byte output buffer (must be pre-allocated)
-//   robotId         - robot identifier (0..15)
-//   counter         - rolling counter (caller increments)
-//   yaw_rad         - orientation in radians (SSL vision convention)
+//   counter         - AI command check counter echo (caller supplies)
+//   tx_cycle        - rolling transmit counter (caller increments)
+//   yaw_rad         - orientation in RADIANS; written to the wire in DEGREES
 //   ball_detected   - is ball in contact with dribbler
 //   kick_status     - 0=none, 1=flat, 2=chip
 //   odom_x_m        - position x in metres (SSL vision coords)
 //   odom_y_m        - position y in metres (SSL vision coords)
 //   vel_x_ms        - global velocity x in m/s (SSL vision coords)
 //   vel_y_ms        - global velocity y in m/s (SSL vision coords)
+//
+// The layout follows the real robot's STM32 main board byte for byte
+// (G474_Orion_main/Core/Src/ai_comm.c sendRobotInfo()), so a consumer cannot
+// tell the simulator from real hardware by parsing. Fields the simulator has
+// no source for are left at the value real hardware sends when that sensor is
+// absent (zero), rather than repurposed -- a simulator-only marker byte would
+// decode as a real field on the consumer side.
 // ---------------------------------------------------------------------------
 
 inline void ibisBuildFeedbackPacket(
     uint8_t* buffer,
-    int      robotId,
     uint8_t  counter,
+    uint8_t  tx_cycle,
     float    yaw_rad,
     bool     ball_detected,
     uint8_t  kick_status,
@@ -222,23 +229,32 @@ inline void ibisBuildFeedbackPacket(
     buffer[0] = 0xAB;
     buffer[1] = 0xEA;
 
-    // Robot ID (2)
-    buffer[2] = static_cast<uint8_t>(robotId);
+    // Checksum placeholder (2). Real hardware writes the constant 10 here
+    // ("CRC, 10:dummy" in ai_comm.c); it never computes a real checksum, so
+    // host-side checksum validation fails on real packets too. Match that
+    // rather than inventing a value -- the robot id is implied by the port.
+    buffer[2] = 10;
 
-    // Counter (3)
+    // AI command check counter echo (3)
     buffer[3] = counter;
 
-    // Yaw angle in radians (4-7)
-    std::memcpy(&buffer[4], &yaw_rad, sizeof(float));
+    // Yaw angle (4-7). The wire format is DEGREES: real hardware sends
+    // imu->yaw_deg here. Sending radians makes consumers that use this field
+    // (e.g. crane_latency_estimator) behave differently in simulation than on
+    // the robot, by a factor of 180/pi.
+    const float yaw_deg = yaw_rad * static_cast<float>(180.0 / M_PI);
+    std::memcpy(&buffer[4], &yaw_deg, sizeof(float));
 
     // Battery voltage: fixed 24.0 V (8-11)
     float voltage = 24.0f;
     std::memcpy(&buffer[8], &voltage, sizeof(float));
 
-    // Ball detection sensors 0-2 (12-14)
+    // Ball detection sensors 0-1 (12-13), then the transmit cycle counter (14).
+    // Byte 14 is NOT a third ball sensor: real hardware puts tx_cycle_count
+    // there (ai_comm.c). Consumers only key the ball sensor off byte 12.
     buffer[12] = ball_detected ? 1 : 0;
     buffer[13] = ball_detected ? 1 : 0;
-    buffer[14] = ball_detected ? 1 : 0;
+    buffer[14] = tx_cycle;
 
     // Kick status (15): 0=none, 1=flat, 2=chip
     buffer[15] = kick_status;
@@ -269,8 +285,11 @@ inline void ibisBuildFeedbackPacket(
     std::memcpy(&buffer[52], &vel_x_ms, sizeof(float));
     std::memcpy(&buffer[56], &vel_y_ms, sizeof(float));
 
-    // Check version byte: 0x01 = simulator (60)
-    buffer[60] = 0x01;
+    // Local camera block (60-63): camera_pos_x_div2 / camera_pos_y /
+    // camera_radius_div4 / camera_fps. The simulator has no local camera, so
+    // these stay 0 -- exactly what real hardware sends with no camera attached.
+    // (This byte previously carried a 0x01 "simulator" marker, which consumers
+    // decoded as camera_pos_x = 2.)
 
-    // Extended data (61-127): 0 (already zeroed)
+    // Extended data (64-127): tx_value_array on real hardware, 0 here.
 }

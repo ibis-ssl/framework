@@ -1008,8 +1008,12 @@ public slots:
             uint8_t buffer[IBIS_FEEDBACK_SIZE];
             ibisBuildFeedbackPacket(
                 buffer,
-                static_cast<int>(id),
+                // Byte 3 echoes the AI command check counter on real hardware.
+                // This adaptor does not see the command stream, so it sends a
+                // free-running counter instead -- still usable for staleness
+                // detection, but it does not correlate with a specific command.
                 m_counters[id]++,
+                m_txCycles[id]++,
                 vis.orientation_rad,
                 m_robotCache[id].ball_detected,
                 0, // kick_status not tracked in ER-Force simulator
@@ -1072,6 +1076,7 @@ private:
     IbisVisionState m_vision[2][kMaxRobots] = {};
     RobotCache      m_robotCache[kMaxRobots] = {};
     uint8_t         m_counters[kMaxRobots]  = {};
+    uint8_t         m_txCycles[kMaxRobots]  = {};
     int             m_waitLogCount          = 0;
 
     PacketSenderThread* m_sender;
