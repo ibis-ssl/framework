@@ -30,6 +30,16 @@ constexpr int    IBIS_FEEDBACK_SIZE      = 128;
 constexpr int    IBIS_FEEDBACK_PORT_BASE = 50100;
 constexpr double IBIS_POSITION_MATCH_THRESHOLD = 0.5; // metres
 
+// Control modes. Must match crane_sender/include/crane_sender/robot_packet.h
+// and Orion_CM4/cm4/bridge/robot_packet.h (ControlMode enum).
+//
+// The simulator plays the role of the robot's STM32 (G474) main board, which
+// only ever implements POLAR_VELOCITY_TARGET. POSITION_TARGET is closed on the
+// robot's CM4 (cm4_sim in simulation), never here -- see
+// docs/robot-side-position-control.md.
+constexpr uint8_t IBIS_MODE_POLAR_VELOCITY_TARGET = 3;
+constexpr uint8_t IBIS_MODE_POSITION_TARGET       = 4;
+
 // ---------------------------------------------------------------------------
 // Byte offsets in the 64-byte RobotCommandSerializedV2 (from crane's robot_packet.h)
 // ---------------------------------------------------------------------------
@@ -80,7 +90,10 @@ enum IbisFlagBit {
 // ---------------------------------------------------------------------------
 
 struct IbisCommand {
+    uint8_t control_mode;            // IBIS_MODE_*
     float   vision_global_pos[2];    // metres, SSL vision coordinate system
+    float   vision_global_theta;     // radians
+    bool    is_vision_available;
     float   target_global_theta;     // radians
     float   kick_power;              // 0..1 normalised
     float   dribble_power;           // 0..1 normalised
@@ -89,8 +102,11 @@ struct IbisCommand {
     float   acceleration_limit;      // m/s^2 (0 means "use default")
     float   linear_velocity_limit;   // m/s   (0 means "no limit")
     float   angular_velocity_limit;  // rad/s
-    float   polar_velocity_r;        // m/s
-    float   polar_velocity_theta;    // radians (global direction)
+    float   polar_velocity_r;        // m/s           (mode 3 args)
+    float   polar_velocity_theta;    // radians (global direction, mode 3 args)
+    float   terminal_velocity_xy[2]; // m/s           (mode 4 args)
+    float   target_global_pos[2];    // metres        (fixed field, modes >= 4)
+    float   terminal_velocity;       // m/s           (fixed field, modes >= 4)
     uint8_t check_counter;
 };
 
@@ -114,8 +130,10 @@ inline IbisCommand ibisDeserialize(const uint8_t* d)
 {
     IbisCommand cmd;
     cmd.check_counter        = d[CHECK_COUNTER];
+    cmd.control_mode         = d[CONTROL_MODE];
     cmd.vision_global_pos[0] = ibisDecodeTwoByte(d[VISION_GLOBAL_X_H], d[VISION_GLOBAL_X_L], 32.767f);
     cmd.vision_global_pos[1] = ibisDecodeTwoByte(d[VISION_GLOBAL_Y_H], d[VISION_GLOBAL_Y_L], 32.767f);
+    cmd.vision_global_theta  = ibisDecodeTwoByte(d[VISION_GLOBAL_TH_H], d[VISION_GLOBAL_TH_L], static_cast<float>(M_PI));
     cmd.target_global_theta  = ibisDecodeTwoByte(d[TARGET_GLOBAL_TH_H], d[TARGET_GLOBAL_TH_L], static_cast<float>(M_PI));
     cmd.kick_power           = d[KICK_POWER] / 20.f;
     cmd.dribble_power        = d[DRIBBLE_POWER] / 20.f;
@@ -124,14 +142,48 @@ inline IbisCommand ibisDeserialize(const uint8_t* d)
     cmd.angular_velocity_limit = ibisDecodeTwoByte(d[ANGULAR_VEL_LIMIT_H], d[ANGULAR_VEL_LIMIT_L], 32.767f);
 
     uint8_t flags = d[FLAGS];
-    cmd.enable_chip    = (flags >> ENABLE_CHIP) & 0x01;
-    cmd.stop_emergency = (flags >> STOP_EMERGENCY) & 0x01;
+    cmd.is_vision_available = (flags >> IS_VISION_AVAILABLE) & 0x01;
+    cmd.enable_chip         = (flags >> ENABLE_CHIP) & 0x01;
+    cmd.stop_emergency      = (flags >> STOP_EMERGENCY) & 0x01;
 
-    // POLAR_VELOCITY_TARGET_MODE args at CONTROL_MODE_ARGS (offset 24)
-    cmd.polar_velocity_r     = ibisDecodeTwoByte(d[CONTROL_MODE_ARGS + 0], d[CONTROL_MODE_ARGS + 1], 32.767f);
-    cmd.polar_velocity_theta = ibisDecodeTwoByte(d[CONTROL_MODE_ARGS + 2], d[CONTROL_MODE_ARGS + 3], 32.767f);
+    // CONTROL_MODE_ARGS (offset 24..31) is a union: its meaning depends on
+    // control_mode. Decoding it unconditionally as polar velocity would read
+    // mode 4's terminal_velocity_x/y as r/theta, which is silent garbage.
+    cmd.polar_velocity_r        = 0.0f;
+    cmd.polar_velocity_theta    = 0.0f;
+    cmd.terminal_velocity_xy[0] = 0.0f;
+    cmd.terminal_velocity_xy[1] = 0.0f;
+    switch (cmd.control_mode) {
+    case IBIS_MODE_POLAR_VELOCITY_TARGET:
+        cmd.polar_velocity_r     = ibisDecodeTwoByte(d[CONTROL_MODE_ARGS + 0], d[CONTROL_MODE_ARGS + 1], 32.767f);
+        cmd.polar_velocity_theta = ibisDecodeTwoByte(d[CONTROL_MODE_ARGS + 2], d[CONTROL_MODE_ARGS + 3], 32.767f);
+        break;
+    case IBIS_MODE_POSITION_TARGET:
+        cmd.terminal_velocity_xy[0] = ibisDecodeTwoByte(d[CONTROL_MODE_ARGS + 0], d[CONTROL_MODE_ARGS + 1], 32.767f);
+        cmd.terminal_velocity_xy[1] = ibisDecodeTwoByte(d[CONTROL_MODE_ARGS + 2], d[CONTROL_MODE_ARGS + 3], 32.767f);
+        break;
+    default:
+        break;
+    }
+
+    // Fixed fields, present regardless of mode (offsets 32..37).
+    cmd.target_global_pos[0] = ibisDecodeTwoByte(d[TARGET_POS_X_H], d[TARGET_POS_X_L], 32.767f);
+    cmd.target_global_pos[1] = ibisDecodeTwoByte(d[TARGET_POS_Y_H], d[TARGET_POS_Y_L], 32.767f);
+    cmd.terminal_velocity    = ibisDecodeTwoByte(d[TERMINAL_VEL_H], d[TERMINAL_VEL_L], 32.767f);
 
     return cmd;
+}
+
+// True when a robot slot carries no command at all. Senders zero-fill the slots
+// of robots they do not control; a zero-filled slot decodes to a position of
+// (-32.767, -32.767) which no team match would accept, but relying on that is
+// accidental -- check explicitly instead.
+inline bool ibisSlotIsEmpty(const uint8_t* d)
+{
+    for (int i = 0; i < IBIS_CMD_SIZE; ++i) {
+        if (d[i] != 0) { return false; }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
