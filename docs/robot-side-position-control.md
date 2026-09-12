@@ -113,6 +113,47 @@ FLAGS: bit0 `IS_VISION_AVAILABLE` / bit1 `ENABLE_CHIP` / bit3 `STOP_EMERGENCY`
 | 3 | `POLAR_VELOCITY_TARGET_MODE` | `target_global_velocity_r`, `target_global_velocity_theta` | CM4 → G474 / cm4_sim → simulator-cli |
 | 4 | `POSITION_TARGET_WITH_TERMINAL_VELOCITY_MODE` | `terminal_velocity_x`, `terminal_velocity_y` | crane → CM4 / crane → cm4_sim |
 
+#### mode 4 の終端速度フィールドの意味（重要）
+
+mode 4 は終端速度を 2 か所で運ぶが、**これらは冗長ではなく意味が違う**。
+
+| フィールド | 位置 | 意味 |
+|---|---|---|
+| `terminal_velocity_x` / `terminal_velocity_y` | ARGS 24..27 | 目標位置に到達した瞬間の速度**ベクトル**（グローバル座標, m/s）。フィードフォワード項であり、向きに意味がある |
+| `terminal_velocity`（= crane の `speed_limit_at_target`） | 32..37 の 36..37 | 上のベクトルの**大きさに対する上限**（スカラ）。名前に反して「終端速度そのもの」ではない |
+
+**受信側（CM4）が適用すべき規則**（`crane_sender/src/sim_position_controller.cpp`
+`calculateSimGlobalVelocity()` が参照実装）:
+
+```
+feedforward = (terminal_velocity_x, terminal_velocity_y)
+if terminal_velocity > 0:        # スカラ上限。0 は「上限なし」であって「停止」ではない
+    feedforward = clampNorm(feedforward, terminal_velocity)
+```
+
+- **送信側に整合義務は無い。** クランプするのは受信側。
+  `|v_xy| == terminal_velocity` を crane に要求しない。
+- `terminal_velocity == 0` は **上限なし**（クランプをスキップ）。
+  停止させたい場合は `terminal_velocity_x/y` 自体を 0 にする。実際
+  `visibility_graph_planner.cpp` の到達時分岐はそうしている。
+- なお現行の VisibilityGraphPlanner は非最終ウェイポイントで
+  `speed_limit_at_target = terminal_speed` かつ
+  `terminal_velocity_xy = direction * terminal_speed` を入れるので、結果として
+  両者の大きさは一致する。これは実装の都合であって仕様上の保証ではない。
+
+#### 伝送されないフィールド
+
+`crane_msgs/msg/PositionTargetMode.msg` の `position_tolerance` は
+**ibis パケットに載っていない**（`createRobotPacket()` が送っていない）。
+参照実装は到達判定に
+`error.norm() <= position_tolerance && feedforward.norm() < 1e-4` を使うため、
+CM4 はこの判定をそのまま再現できない。
+
+暫定方針: CM4 側の固定定数（例 0.02 m）を使う。
+ARGS には 28..31 の 4 バイトが空いているので、精度が問題になるなら
+`position_tolerance` を 28..29 へ載せる拡張が可能。その場合は 4 リポジトリすべての
+`robot_packet.h` を同時に更新すること。
+
 **`CONTROL_MODE_ARGS` は union であり、`CONTROL_MODE` を見ずに復号してはならない。**
 mode 4 のパケットを mode 3 として復号すると、`terminal_velocity_x/y` が
 `r/theta` として読まれ、無言で暴走する。
@@ -130,17 +171,54 @@ mode 4 のパケットを mode 3 として復号すると、`terminal_velocity_x
 | crane → cm4_sim（位置指令） | `127.0.0.1:12345` | 実機の AI 指令ポートと同じ |
 | cm4_sim → simulator-cli（速度指令） | `127.0.0.1:12346` | `simulator-cli --ibis-port 12346` |
 | simulator-cli → cm4_sim（feedback） | `127.0.0.1:50100+id` | `--ibis-feedback-addr 127.0.0.1`（既定） |
-| cm4_sim → crane / host（feedback 再配信） | `224.5.20.(100+id):50100+id` | 実機と同じ multicast |
+| cm4_sim → crane / host（feedback 再配信） | `224.5.20.(100+id):50100+id` | 実機と同じ multicast。**crane 側に `feedback_sim_mode:=false` が必須**（下記） |
 | simulator-cli → crane（vision） | `224.5.23.2:10020`（既定・変更不可） | 変更なし |
 
-feedback のベースポートは **実機と同じ 50100 のまま** でよい。同一ホスト上で
+### feedback ポートの取り合い（必読・踏むと沈黙して壊れる）
 
-- `cm4_sim` が `127.0.0.1:50100+id` を bind（simulator-cli からの unicast を受ける）
-- `crane_robot_receiver` が `224.5.20.(100+i):50100+i` を bind（multicast を受ける）
+feedback のベースポートは実機と同じ 50100 を使うが、**crane を素の `sim:=true` で
+起動すると cm4_sim と衝突する。**
 
-という 2 つの bind が同居するが、**これらはポート番号が同じでも競合しない**ことを
-実測で確認済み。unicast は unicast ソケットにのみ、multicast は multicast ソケットに
-のみ配送され、取り違えも起きない。両者とも `SO_REUSEADDR` を設定すること。
+`crane_robot_receiver` は `sim_mode` が真だと購読先を `127.0.0.1` に切り替える
+（`robot_receiver_node.cpp:351-352`）。`crane_comm/unicast.hpp:81` は
+`addr.is_multicast()` で分岐するため、`127.0.0.1` は multicast 側ではなく
+`:138-139` の素の bind に落ち、**グループ参加もしない**。さらに `:78-79` で
+`SO_REUSEADDR` と **`SO_REUSEPORT` の両方**を設定している。
+
+つまり `sim:=true` の crane は、cm4_sim が simulator-cli の feedback を受けるために
+必要な `127.0.0.1:50100+id` を、まったく同じ形で先に押さえる。
+
+`SO_REUSEPORT` 付きの 2 ソケットが同一ポートを bind した場合の実測（unicast 200 発、
+送信元は単一ソケット）:
+
+| | 受信数 |
+|---|---|
+| socket A | **0** |
+| socket B | **200** |
+
+**均等分割ではなく片方が全部取る。** `SO_REUSEPORT` の振り分けは送信元を含む
+4-tuple ハッシュで決まるため、simulator-cli が単一ソケットから送る feedback は
+単一フローとなり、必ずどちらか一方に全量が入る。どちらが当たるかはハッシュ次第で
+実行ごとに変わりうる。
+
+新構成では feedback が位置制御ループ内で**唯一の位置信号**なので、これは
+「cm4_sim の位置制御が完全に死ぬ」か「正常に動く」かの二択になり、しかも
+実行ごとに変わるため切り分けが極めて困難になる。
+
+**対処**: CM4-in-the-loop 構成では crane に **`feedback_sim_mode:=false`** を渡す
+（`crane.launch.xml` に新設済み。既定は `$(var sim)` なので既存構成は不変）。
+これで crane は実機と同じ `224.5.20.(100+id):50100+id` の multicast を bind し、
+unicast は cm4_sim が独占する。
+
+この条件下では両者は競合しない。multicast 受け（`0.0.0.0:port` bind + group join）と
+unicast 受け（`127.0.0.1:port` bind）の同居を実測した結果:
+
+| 送信 | multicast socket | unicast socket |
+|---|---|---|
+| unicast 200 発 | 0 | 200 |
+| multicast 200 発 | 200 | 0 |
+
+完全に分離され、取り違えも取り合いも起きない。
 
 simulator-cli の `--ibis-feedback-addr` の既定値が `127.0.0.1` なので、
 feedback 関連のオプション指定は不要である。
@@ -238,14 +316,33 @@ simulator-cli 側に位置制御は **実装しない**。実装すると制御�
 この設計の主張は「無線経路をループ外に出すと、遅延・ジッタ・ロスに強くなる」
 である。それを示すには、同じ劣化条件下で旧構成と新構成を比較する必要がある。
 
+比較を成立させるには、**劣化注入点が両構成で同一**でなければならない。
+旧構成を「crane → simulator-cli 直送」にすると経路上に注入器が無く、比較にならない。
+
+そこで `cm4_sim` は **受信した mode で振る舞いを切り替える**:
+
+| 受信 mode | cm4_sim の動作 |
+|---|---|
+| 3（polar velocity） | 位置制御をせずそのまま転送（passthrough）。実機の CM4 の現行動作と同じ |
+| 4（position target） | 位置制御ループを回して mode 3 を生成 |
+
+劣化注入は mode によらず**入力側で常に適用**する。これで両構成は次のようになる。
+
 | | 旧構成 | 新構成 |
 |---|---|---|
 | crane | 位置ループを閉じ mode 3 を送る | mode 4 を送る |
-| 経路 | crane → simulator-cli | crane → cm4_sim → simulator-cli |
-| 劣化注入 | crane の送信経路 | cm4_sim の入力側 |
+| 経路 | crane → cm4_sim(passthrough) → simulator-cli | crane → cm4_sim(位置制御) → simulator-cli |
+| 劣化注入 | cm4_sim 入力側 | cm4_sim 入力側（同一コード経路） |
+| 位置ループの位置 | crane（無線がループ内） | CM4（無線がループ外） |
 
-`cm4_sim` の入力側に `--rx-delay-ms` / `--rx-jitter-ms` / `--rx-loss-rate` を実装し、
-両構成を同一条件で走らせて追従誤差・オーバーシュート・到達時間を比較する。
+**独立変数は「位置ループをどこで閉じるか」だけ**になり、転送経路・注入点・注入実装が
+両者で完全に一致する。旧構成が厳密な「直送」でなくなるが、localhost の UDP 1 ホップ
+追加は無線劣化に比べて無視できる。mode による分岐は実機の CM4 にも必要な後方互換
+経路なので、シミュレータ専用の仕掛けを増やすことにもならない。
+
+`cm4_sim` の入力側に `--rx-delay-ms` / `--rx-jitter-ms` / `--rx-loss-rate` と
+再現用のシードを実装し、両構成を同一条件で走らせて追従誤差・オーバーシュート・
+到達時間を比較する。
 
 ### simulator-cli 側のスモークテスト
 
