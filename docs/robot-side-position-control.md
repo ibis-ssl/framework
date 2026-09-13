@@ -449,22 +449,34 @@ python3 data/scripts/ibis-chain-smoketest.py [path/to/simulator-cli]
   **実機のこの分岐は制動ではなく惰走**。一方 mode 3 で `r = 0` を送った場合は
   `omniMoveIndiv` に入り車輪 PID が効く。シミュレータもこの2経路を再現している。
 
-  | 停止のかけ方 | 経路 | 1.5 m/s からの停止距離 |
+  | 停止のかけ方 | 経路 | 1.45 m/s からの停止距離 |
   |---|---|---|
-  | mode 3 で `r = 0` | 車輪 PID（能動制動） | 0.126 m |
-  | `STOP_EMERGENCY` / vision 断 | `move_command` を出さない（惰走） | 0.571 m |
-  | 指令が届かない（0.1 s で standby） | 同上（惰走） | 0.573 m |
+  | mode 3 で `r = 0` | 車輪 PID（能動制動） | 0.13 m |
+  | `STOP_EMERGENCY` / vision 断 | `move_command` を出さない（惰走） | 0.63 m |
+  | 指令が届かない | 0.1 s は前の指令のまま → standby（惰走） | 0.76 m |
+
+  **測定は必ず +y 方向で、blue と yellow の両方で取ること。** ロボットの開始位置は
+  y = -2.8 付近で、-y は壁、±x は他のロボットに塞がれている。塞がれた向きで測ると
+  停止距離が 0.12〜0.40 m の範囲で不規則にばらつき、しかも「それらしい値」に見える。
+  両チームで測って一致すれば自由惰走、食い違えば何かに当たっている。測定は
+  `data/scripts/ibis-stop-distance.py` にしてあり、両チームの一致も検査する。
+
+  **指令途絶が `STOP_EMERGENCY` より 0.13 m 長いのは正しい。** `SimRobot` は最後の
+  指令から 0.1 s 経つまで前の指令を実行し続けるので、その間は駆動力がかかっている。
+  `STOP_EMERGENCY` は指令が届いた時点で即座に駆動を切るので、その分だけ短い。
+  **ただしこの 0.1 s は実機の 250 ms（`connected_ai` タイムアウト）より短い**ので、
+  指令途絶時の惰走距離はシミュレータの方が実機より短く出る。
 
   残る不確定は1段下で、**duty 0 が空転なのか短絡制動なのかはモータボード側の
   ファームウェアが決める**。これは `G474_Orion_main` にも CM4 側にも無いため、
-  惰走距離の絶対値は実機で測るしかない。上の 0.571 m は比較対象であって実機の
+  惰走距離の絶対値は実機で測るしかない。上の 0.63 m は比較対象であって実機の
   予測値ではない。なお mode 4 が届いた場合の停止だけは能動制動のまま残してある。
   これは実機に対応物が無い「構成ミス」の合図なので、惰走させると発見が遅れるため。
 - **feedback の速度は指令が届いたときしか更新されない。** 速度（byte 52/56）は
   `RadioResponse` 由来のキャッシュで、`RadioResponse` は指令が届いたときにしか
   生成されない。一方で位置（byte 44/48）は毎周期 vision から詰め直される。このため
   指令が破棄されている間、**同じパケットの中で位置は新鮮なのに速度は破棄直前の値で
-  凍る**。実測ではロボットが約 1.0 s で停止した後も 1.461 m/s を返し続けた。
+  凍る**。実測ではロボットが約 1.0 s で停止した後も 1.46 m/s を返し続けた。
   「速度が出ているのに位置が動かない」feedback を見たら、ロボットの挙動ではなく
   指令が届いているかをまず疑うこと。`cm4_sim` は位置だけを使ってループを閉じるので
   現状の制御には影響しないが、速度を見る診断は騙される。なお `STOP_EMERGENCY` に
@@ -478,6 +490,7 @@ python3 data/scripts/ibis-chain-smoketest.py [path/to/simulator-cli]
 
 - `src/simulator/ibis_protocol.h` — プロトコル定義（framework 側）
 - `data/scripts/ibis-chain-smoketest.py` — ibis コマンド経路のスモークテスト
+- `data/scripts/ibis-stop-distance.py` — 停止 3 経路の停止距離測定（両チーム一致で検査）
 - `src/simulator/simulator.cpp` — `IbisCommandAdaptor` / `IbisFeedbackAdaptor`
 - `src/amun/simulator/simulator.cpp` — `handleSimulatorTick()`、feedback 送出
 - `Orion_CM4/cm4/bridge/robot_packet.h` — CM4 側パケット定義（要統一）
