@@ -949,12 +949,15 @@ private:
 class IbisFeedbackAdaptor : public QObject {
     Q_OBJECT
 public:
-    IbisFeedbackAdaptor(const QHostAddress& addr, quint16 portBase, bool useReferee)
+    // explicitColorSet: --ibis-team-color was given, so the colour is known up
+    // front and the referee (if also enabled) may only correct it later.
+    IbisFeedbackAdaptor(const QHostAddress& addr, quint16 portBase, bool useReferee,
+                        bool explicitColorSet, bool explicitIsBlue)
         : m_sender(new PacketSenderThread())
         , m_addr(addr)
         , m_portBase(portBase)
-        , m_ibisIsBlue(true)
-        , m_refereeResolved(!useReferee)
+        , m_ibisIsBlue(explicitColorSet ? explicitIsBlue : true)
+        , m_refereeResolved(explicitColorSet || !useReferee)
     {}
 
     ~IbisFeedbackAdaptor() override {
@@ -994,8 +997,14 @@ public slots:
         updateTeam(state.blue_robots(),   0);
         updateTeam(state.yellow_robots(), 1);
         if (!m_refereeResolved) {
+            // No feedback at all goes out until the colour is known. Say so:
+            // a controller that closes its position loop on this feedback has
+            // no position signal while this message is printing.
             if (++m_waitLogCount % 200 == 0) {
-                log(stdout, "ibis: waiting for Game Controller to identify team color\n");
+                log(stdout,
+                    "ibis: NO FEEDBACK IS BEING SENT -- still waiting for the Game Controller "
+                    "to identify team color. If the referee does not carry the team name, "
+                    "pass --ibis-team-color blue|yellow instead of --ibis-use-referee.\n");
             }
             return;
         }
@@ -1123,6 +1132,7 @@ int main(int argc, char* argv[])
     QCommandLineOption ibisFeedbackPortBaseOpt("ibis-feedback-port-base", "ibis feedback base port (robotId is added)", "port", QString::number(IBIS_FEEDBACK_PORT_BASE));
     QCommandLineOption ibisFeedbackTeamNameOpt("ibis-feedback-team-name", "Team name to look up in Game Controller for color detection", "name", "ibis");
     QCommandLineOption ibisUseRefereeOpt("ibis-use-referee", "Use Game Controller referee to auto-detect ibis team color");
+    QCommandLineOption ibisTeamColorOpt("ibis-team-color", "Set the ibis team color explicitly (blue|yellow), instead of detecting it from the Game Controller", "color", "");
     QCommandLineOption ibisAccSpeedupOpt("ibis-acc-speedup", "Acceleration limit for speedup [m/s^2]", "accel", "4.0");
     QCommandLineOption ibisAccBrakeOpt("ibis-acc-brake", "Acceleration limit for braking [m/s^2]", "accel", "6.0");
     QCommandLineOption ibisRefereePortOpt("ibis-referee-port", "Game Controller multicast port for team color detection", "port", QString::number(SSL_GAME_CONTROLLER_PORT));
@@ -1131,6 +1141,7 @@ int main(int argc, char* argv[])
     parser.addOption(ibisFeedbackPortBaseOpt);
     parser.addOption(ibisFeedbackTeamNameOpt);
     parser.addOption(ibisUseRefereeOpt);
+    parser.addOption(ibisTeamColorOpt);
     parser.addOption(ibisAccSpeedupOpt);
     parser.addOption(ibisAccBrakeOpt);
     parser.addOption(ibisRefereePortOpt);
@@ -1214,10 +1225,42 @@ int main(int argc, char* argv[])
         const QHostAddress fbAddr   = QHostAddress(parser.value(ibisFeedbackAddrOpt));
         const quint16 fbPortBase    = static_cast<quint16>(parser.value(ibisFeedbackPortBaseOpt).toUInt());
         const bool useReferee       = parser.isSet(ibisUseRefereeOpt);
+
+        // Team colour selects which team's ground truth the feedback carries.
+        // Getting it wrong is silent and nasty: the feedback still flows, but
+        // it describes the opponent's robots, so anything closing a position
+        // loop on it steers on the wrong positions.
+        const QString teamColorStr = parser.value(ibisTeamColorOpt).trimmed().toLower();
+        bool explicitColorSet = false;
+        bool explicitIsBlue   = true;
+        if (!teamColorStr.isEmpty()) {
+            if (teamColorStr == "blue") {
+                explicitColorSet = true; explicitIsBlue = true;
+            } else if (teamColorStr == "yellow") {
+                explicitColorSet = true; explicitIsBlue = false;
+            } else {
+                log(stdout, "ibis: unknown --ibis-team-color '%s', expected blue or yellow\n",
+                    teamColorStr.toStdString().c_str());
+                return 1;
+            }
+        }
+        if (explicitColorSet) {
+            log(stdout, "ibis: team color set to %s by --ibis-team-color\n",
+                explicitIsBlue ? "BLUE" : "YELLOW");
+        } else if (useReferee) {
+            log(stdout, "ibis: team color will be detected from the Game Controller "
+                        "(team name '%s'); no feedback is sent until it resolves\n",
+                parser.value(ibisFeedbackTeamNameOpt).toStdString().c_str());
+        } else {
+            log(stdout, "ibis: WARNING no team color given and referee detection is off -- "
+                        "assuming BLUE. If ibis plays yellow, the feedback will carry the "
+                        "opponent's positions. Pass --ibis-team-color blue|yellow.\n");
+        }
         const quint16 refereePort   = static_cast<quint16>(parser.value(ibisRefereePortOpt).toUInt());
 
         auto* ibisCmd = new IbisCommandAdaptor(cmdPort, &timer, accSpeedup, accBrake);
-        auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee);
+        auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee,
+                                               explicitColorSet, explicitIsBlue);
 
         // IbisCommandAdaptor receives vision data to cache robot positions/orientations
         QObject::connect(&sim, &SimProxy::gotPacket,
