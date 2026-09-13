@@ -101,8 +101,9 @@ class Simulator:
         ]
         self.log_path = log_path
         self.log = open(log_path, "w") if log_path else subprocess.DEVNULL
-        # stdbuf: log() in simulator.cpp does not flush, and SIGTERM would drop
-        # a block-buffered pipe.
+        # stdbuf is redundant against a current simulator-cli, which line-buffers
+        # its own stdout; keep it so this script still captures logs from an older
+        # binary, where log() never flushed and SIGTERM dropped the whole buffer.
         self.proc = subprocess.Popen(["stdbuf", "-oL", "-eL"] + args,
                                      stdout=self.log, stderr=subprocess.STDOUT)
         self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
