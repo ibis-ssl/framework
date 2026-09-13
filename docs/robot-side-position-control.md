@@ -276,7 +276,16 @@ crane の world model 推定をそのまま送るので無防備である。cran
 ### ログのバッファリング（Docker / systemd で踏む）
 
 `simulator-cli` は `main()` で `setvbuf(stdout, nullptr, _IOLBF, 0)` を呼び、
-**自分で行バッファリングする**。呼び出し側が `stdbuf -oL` を付ける必要は無い。
+**自分で stdout を行バッファリングする**。呼び出し側が `stdbuf -oL` を付ける必要は無い。
+
+**`stderr` には設定しない。** glibc は stderr を既定で **バッファ無し**にしており、
+`_IOLBF` はそれより弱い設定になる（改行で終わらない出力を抱え込むようになる）。
+実測（改行なしで出力してから `SIGTERM`）:
+
+| stderr の設定 | 残ったバイト数 |
+|---|---|
+| 既定（glibc, バッファ無し） | 27 |
+| `setvbuf(_IOLBF)` | **0** |
 
 これが無いと、stdout がパイプやファイルのとき（Docker・systemd・テストハーネスは
 すべてそう）ブロックバッファリングされ、`log()` は flush しないので **SIGTERM で
