@@ -736,20 +736,27 @@ private slots:
                 // Also keeps the matched vision entry for orientation lookup below.
                 int teamIdx = -1;
                 const IbisVisionState* vis = nullptr;
+                double nearest = -1.0;
                 for (int t = 0; t < 2; ++t) {
                     const IbisVisionState& v = m_vision[t][robot_id];
                     if (!v.valid) { continue; }
                     const float dx = v.x_mm / 1000.0f - cmd.vision_global_pos[0];
                     const float dy = v.y_mm / 1000.0f - cmd.vision_global_pos[1];
-                    if (std::hypot(dx, dy) < IBIS_POSITION_MATCH_THRESHOLD) {
+                    const double dist = std::hypot(dx, dy);
+                    if (nearest < 0.0 || dist < nearest) {
+                        nearest = dist;
+                    }
+                    if (dist < IBIS_POSITION_MATCH_THRESHOLD) {
                         teamIdx = t;
                         vis = &v;
                         break;
                     }
                 }
                 if (teamIdx < 0) {
+                    warnPositionMismatch(robot_id, cmd, nearest);
                     continue;
                 }
+                m_robotStates[robot_id].match_warned = false;
                 const bool ibisIsBlue = (teamIdx == 0);
 
                 auto* robotCmd = ibisIsBlue
@@ -882,6 +889,39 @@ private:
         }
     }
 
+    // The command carries the sender's own estimate of where the robot is
+    // (vision_global_pos). When it does not match any robot on the field the command
+    // is dropped -- silently, until this warning was added. A silent drop is very hard
+    // to tell apart from "the robot is commanded to hold still": the packets keep
+    // arriving, check_counter keeps advancing, and nothing moves. Report the nearest
+    // candidate so the reader can see whether the estimate is merely stale (slightly
+    // over the threshold) or pointing somewhere else entirely.
+    void warnPositionMismatch(int robot_id, const IbisCommand& cmd, double nearest) {
+        constexpr qint64 kWarnIntervalNs = 1000LL * 1000LL * 1000LL;
+        auto& state = m_robotStates[robot_id];
+        const qint64 now = m_timer->currentTime();
+        if (state.match_warned && now - state.last_match_warn_ns < kWarnIntervalNs) {
+            return;
+        }
+        state.match_warned = true;
+        state.last_match_warn_ns = now;
+        if (nearest < 0.0) {
+            log(stdout,
+                "ibis: robot %d command dropped -- no robot with this id is on the field yet "
+                "(command claims the robot is at %.3f, %.3f). Commands are ignored until "
+                "vision reports the robot.\n",
+                robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1]);
+        } else {
+            log(stdout,
+                "ibis: robot %d command dropped -- vision_global_pos (%.3f, %.3f) is %.3f m "
+                "from the robot, over the %.2f m match threshold. The sender's position "
+                "estimate disagrees with the simulator; the robot will not move until they "
+                "agree. See docs/robot-side-position-control.md\n",
+                robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1],
+                nearest, IBIS_POSITION_MATCH_THRESHOLD);
+        }
+    }
+
     static constexpr uint32_t kMaxRobots = 16;
 
     struct PerRobotState {
@@ -890,6 +930,8 @@ private:
         uint8_t last_check_counter = 0xFF;
         qint64  last_mode_warn_ns  = 0;
         bool    mode_warned        = false;
+        qint64  last_match_warn_ns = 0;
+        bool    match_warned       = false;
     };
 
     // m_vision[0] = blue, m_vision[1] = yellow

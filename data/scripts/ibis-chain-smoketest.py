@@ -5,9 +5,12 @@ POLAR_VELOCITY_TARGET (control mode 3) only and never closes a position loop.
 POSITION_TARGET (mode 4) belongs to the robot-side CM4 controller that runs
 between crane and the simulator. See docs/robot-side-position-control.md.
 
-Checks, both against a real simulator-cli process over UDP:
+Checks, all against a real simulator-cli process over UDP:
   1. a mode 3 command drives the robot
   2. a mode 4 command stops it and logs a rate-limited warning
+  3. a command whose vision_global_pos disagrees with the simulator is dropped,
+     and says so -- this drop used to be silent, which is indistinguishable from
+     "commanded to hold still" while packets keep arriving
 
 Usage: python3 data/scripts/ibis-chain-smoketest.py [path/to/simulator-cli]
 """
@@ -192,6 +195,55 @@ def run_commands(binary, log_path):
         sim.close()
 
 
+def run_position_mismatch(binary, log_path):
+    """A command claiming the wrong robot position is dropped, and says so.
+
+    The simulator identifies the robot by matching the command's vision_global_pos
+    against the robots on the field. A sender whose own position estimate has
+    drifted past the threshold gets its commands dropped -- which looks exactly
+    like a robot commanded to hold still, so the log line is the only way to tell.
+    """
+    sim = Simulator(binary, log_path=log_path)
+    try:
+        state = None
+        for _ in range(20):
+            if not sim.alive():
+                return False, (f"simulator-cli exited (rc={sim.proc.returncode}); "
+                               f"see {log_path}")
+            state = sim.recv()
+            if state:
+                break
+        if state is None:
+            return False, f"no feedback from simulator; see {log_path}"
+        start = dict(state)
+
+        # Far enough past the threshold that feedback lag cannot pull it back under.
+        offset = 1.0
+        deadline = time.time() + 2.0
+        counter = 1
+        while time.time() < deadline:
+            claimed = (state["x"] + offset, state["y"])
+            cmd = build_command(counter, claimed, state["yaw"],
+                                MODE_POLAR_VELOCITY, (1.5, 0.0))
+            sim.send(build_packet(0, cmd))
+            counter += 1
+            time.sleep(1 / 60)
+            sim.rx.settimeout(0.001)
+            try:
+                while True:
+                    got = parse_feedback(sim.rx.recv(256))
+                    if got:
+                        state = got
+            except socket.timeout:
+                pass
+
+        moved = distance(state, start)
+        return moved < 0.05, (f"claimed a position {offset:.1f} m off, robot moved "
+                              f"{moved:.3f} m (want ~0)")
+    finally:
+        sim.close()
+
+
 def main():
     repo = Path(__file__).resolve().parents[2]
     binary = Path(sys.argv[1]) if len(sys.argv) > 1 else repo / "build" / "bin" / "simulator-cli"
@@ -201,17 +253,37 @@ def main():
 
     tmp = Path(tempfile.mkdtemp(prefix="ibis-smoketest-"))
     log = tmp / "simulator-cli.log"
+    mismatch_log = tmp / "simulator-cli-mismatch.log"
 
     failures = 0
     ok, detail = run_commands(binary, log)
     print(f"[{'PASS' if ok else 'FAIL'}] commands: {detail}")
     failures += 0 if ok else 1
 
-    warnings = [line for line in log.read_text().splitlines()
-                if "POSITION_TARGET" in line]
+    text = log.read_text()
+    warnings = [line for line in text.splitlines() if "POSITION_TARGET" in line]
     ok = len(warnings) > 0
     print(f"[{'PASS' if ok else 'FAIL'}] warning: {len(warnings)} POSITION_TARGET "
           f"warning(s) logged (rate limited to 1/s per robot)")
+    failures += 0 if ok else 1
+
+    # The commands above always claim the position the feedback just reported, so a
+    # drop here would mean the matching rejects agreeing positions.
+    stray = [line for line in text.splitlines() if "command dropped" in line]
+    ok = not stray
+    print(f"[{'PASS' if ok else 'FAIL'}] no false drops: {len(stray)} drop warning(s) "
+          f"while the claimed position agreed (want 0)")
+    failures += 0 if ok else 1
+
+    ok, detail = run_position_mismatch(binary, mismatch_log)
+    print(f"[{'PASS' if ok else 'FAIL'}] position mismatch: {detail}")
+    failures += 0 if ok else 1
+
+    drops = [line for line in mismatch_log.read_text().splitlines()
+             if "command dropped" in line]
+    ok = len(drops) > 0
+    print(f"[{'PASS' if ok else 'FAIL'}] drop warning: {len(drops)} warning(s) logged "
+          f"(rate limited to 1/s per robot)")
     failures += 0 if ok else 1
 
     print(f"\nlogs: {tmp}")
