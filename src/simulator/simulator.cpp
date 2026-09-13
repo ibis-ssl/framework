@@ -765,10 +765,18 @@ private slots:
                 robotCmd->set_id(robot_id);
 
                 if (ibisShouldStop(cmd)) {
-                    auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
-                    lv->set_forward(0.0f);
-                    lv->set_left(0.0f);
-                    lv->set_angular(0.0f);
+                    // Deliberately no move_command: the real G474 answers this condition
+                    // with omniStopAll() (state_func.c:314), which writes duty 0 to all
+                    // four wheels, and the CAN frame carries duty only -- there is no
+                    // brake bit (actuator.c:12). So hardware coasts here, it does not
+                    // brake. Leaving move_command unset lands on SimRobot's
+                    // !has_move_command() early return, which skips the wheel PID and
+                    // lets the robot coast the same way. Emitting a zero velocity would
+                    // instead drive the PID and brake in 0.133 m vs 0.573 m coasting,
+                    // making every safety stop look better in simulation than on the
+                    // field. prev_v* still has to be cleared: it is the mode 3
+                    // acceleration-limiter state, so a stale value would ramp the first
+                    // command after the stop clears from the pre-stop velocity.
                     m_robotStates[robot_id].prev_vx = 0.0;
                     m_robotStates[robot_id].prev_vy = 0.0;
                 } else if (cmd.control_mode != IBIS_MODE_POLAR_VELOCITY_TARGET) {
@@ -915,8 +923,8 @@ private:
             log(stdout,
                 "ibis: robot %d command dropped -- vision_global_pos (%.3f, %.3f) is %.3f m "
                 "from the robot, over the %.2f m match threshold. The sender's position "
-                "estimate disagrees with the simulator; the robot will not move until they "
-                "agree. See docs/robot-side-position-control.md\n",
+                "estimate disagrees with the simulator; the robot coasts to a stop and "
+                "stays there until they agree. See docs/robot-side-position-control.md\n",
                 robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1],
                 nearest, IBIS_POSITION_MATCH_THRESHOLD);
         }
