@@ -915,8 +915,8 @@ private:
             log(stdout,
                 "ibis: robot %d command dropped -- vision_global_pos (%.3f, %.3f) is %.3f m "
                 "from the robot, over the %.2f m match threshold. The sender's position "
-                "estimate disagrees with the simulator; the robot will not move until they "
-                "agree. See docs/robot-side-position-control.md\n",
+                "estimate disagrees with the simulator; the robot coasts to a stop and "
+                "stays there until they agree. See docs/robot-side-position-control.md\n",
                 robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1],
                 nearest, IBIS_POSITION_MATCH_THRESHOLD);
         }
