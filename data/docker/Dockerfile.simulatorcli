@@ -10,8 +10,7 @@ RUN set -xe; \
 	apt-get install --no-install-recommends -y \
 		cmake make g++ libssl-dev patch \
 		protobuf-compiler libprotobuf-dev \
-		qt6-base-dev libqt6opengl6-dev \
-		qtbase5-dev libqt5opengl5-dev; \
+		qt6-base-dev libqt6opengl6-dev; \
 	apt-get clean -y; \
 	rm -rf /var/lib/apt/lists/*;
 
@@ -22,9 +21,9 @@ COPY . .
 RUN set -xe; \
 	mkdir build; \
 	cd build; \
-	cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..; \
+	cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRELATIVE_DATA_DIRS=ON ..; \
 	make simulator-cli -j $(nproc); \
-	find . -maxdepth 1 ! -name 'bin' -exec rm -r {} \; ;
+	cmake --install . --prefix /home/default/install;
 
 #
 # Run stage
@@ -37,9 +36,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN set -xe; \
 	apt-get update; \
 	apt-get install --no-install-recommends -y \
-	    qt6-base-dev libqt6opengl6-dev \
-		qtbase5-dev libqt5opengl5-dev \
-		libprotobuf-dev tini; \
+		libqt6core6t64 libqt6gui6t64 libqt6network6t64 libqt6opengl6t64 \
+		libprotobuf32t64 tini; \
 	apt-get clean -y; \
 	rm -rf /var/lib/apt/lists/*;
 
@@ -47,15 +45,13 @@ RUN useradd --create-home --shell /bin/bash default
 USER default
 WORKDIR /home/default
 
-COPY --chown=default:default /data/docker/simulatorcli_entrypoint.bash .
-ENTRYPOINT ["tini", "--", "./simulatorcli_entrypoint.bash"]
-
-COPY --chown=default:default --from=build-stage /home/default/COPYING .
-COPY --chown=default:default --from=build-stage /home/default/COPYING.GPL .
-COPY --chown=default:default --from=build-stage /home/default/config config
-COPY --chown=default:default --from=build-stage /home/default/build build
+COPY --chown=default:default --from=build-stage /home/default/install/bin/simulator-cli bin/simulator-cli
+COPY --chown=default:default --from=build-stage /home/default/install/config config
 
 # 10300: Control - Accepts simulator configuration commands
 # 10301: Blue    - Accepts robot commands by the blue team
 # 10302: Yellow  - Accepts robot commands by the yellow team
 EXPOSE 10300 10301 10302
+
+ENTRYPOINT ["tini", "--"]
+CMD ["./bin/simulator-cli"]

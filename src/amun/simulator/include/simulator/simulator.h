@@ -35,7 +35,7 @@
 
 // higher values break the rolling friction of the ball
 const float SIMULATOR_SCALE = 10.0f;
-const float SUB_TIMESTEP = 1/200.f;
+const float SUB_TIMESTEP = 1/250.f;
 const float COLLISION_MARGIN = 0.04f;
 const unsigned FOCAL_LENGTH = 390;
 
@@ -78,6 +78,7 @@ signals:
     void sendStatus(const Status &status);
     void sendRadioResponses(const QList<robot::RadioResponse> &responses);
     void sendRealData(const QByteArray& data); // sends amun::SimulatorState
+    void sendGroundTruth(const QByteArray& data); // sends world::SimulatorState at 125Hz, no noise
     void sendSSLSimError(const QList<SSLSimError>& errors, ErrorSource source);
 
 public slots:
@@ -117,7 +118,7 @@ private:
     const Timer *m_timer;
     QTimer *m_trigger;
     qint64 m_time;
-    qint64 m_lastSentStatusTime;
+    unsigned int m_simulationFrameCounter;
     double m_timeScaling;
     bool m_enabled;
     bool m_charge;

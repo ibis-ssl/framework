@@ -20,6 +20,7 @@
 add_executable(simulator-cli WIN32 MACOSX_BUNDLE
     simulator.cpp
     ssl_robocup_server.cpp
+    packet_sender_thread.cpp
 )
 
 target_link_libraries(simulator-cli
@@ -29,3 +30,5 @@ target_link_libraries(simulator-cli
     Qt6::Widgets
     amun::simulator
 )
+
+install(TARGETS simulator-cli RUNTIME DESTINATION bin)

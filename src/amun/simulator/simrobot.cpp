@@ -204,6 +204,7 @@ void SimRobot::setDribbleMode(bool perfectDribbler)
         stopDribbling();
     }
     m_perfectDribbler = perfectDribbler;
+    m_dribblerReleaseCooldown = 0.0;
 }
 
 bool SimRobot::handleMoveCommand()
@@ -336,10 +337,25 @@ void SimRobot::begin(SimBall *ball, double time)
         m_inStandby = true;
     }
 
+    if (m_dribblerReleaseCooldown > 0.0) {
+        m_dribblerReleaseCooldown = std::max(0.0, m_dribblerReleaseCooldown - time);
+    }
+
+    // detect excessive constraint force and release the ball (grSim: checkDribbleFeedback, threshold 0.5 N)
+    if (m_holdBallConstraint) {
+        const float impulse = m_holdBallConstraint->getAppliedImpulse();
+        const float force = impulse / SUB_TIMESTEP;
+        if (force > 0.5f) {
+            stopDribbling();
+            m_dribblerReleaseCooldown = 0.1;
+        }
+    }
+
     // enable dribbler if necessary
-    if (!m_inStandby && m_sslCommand.has_dribbler_speed() && m_sslCommand.dribbler_speed() > 0) {
+    if (!m_inStandby && m_sslCommand.has_dribbler_speed() && m_sslCommand.dribbler_speed() > 0
+            && m_dribblerReleaseCooldown <= 0.0) {
         dribble(ball, m_sslCommand.dribbler_speed());
-    } else {
+    } else if (m_dribblerReleaseCooldown <= 0.0) {
         stopDribbling();
     }
 

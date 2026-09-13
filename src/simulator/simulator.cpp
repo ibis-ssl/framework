@@ -24,6 +24,7 @@
 #include <QNetworkDatagram>
 #include <QCommandLineParser>
 #include <QTime>
+#include <QTimer>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
@@ -46,6 +47,12 @@
 #include "core/sslprotocols.h"
 
 #include "ssl_robocup_server.h"
+#include "ibis_protocol.h"
+#include "packet_sender_thread.h"
+
+#include "protobuf/ssl_vision/ssl_wrapper.pb.h"
+#include "protobuf/ssl_gc/state/ssl_gc_referee_message.pb.h"
+#include "protobuf/world.pb.h"
 
 /**
  * Stand alone Erforce simulator
@@ -592,6 +599,7 @@ signals:
     void sendSSLSimError(const QList<SSLSimError>& errors, ErrorSource source); // out
     void sendRadioResponses(const QList<robot::RadioResponse> &responses); // out
     void gotPacket(const QByteArray &data, qint64 time, QString sender); // out
+    void sendGroundTruth(const QByteArray& data); // out - world::SimulatorState at 125Hz
     void gotCommand(const Command &command); // internal
     void handleRadioCommands(const SSLSimRobotControl& control, bool isBlue, qint64 processingStart); // in
 public slots:
@@ -637,6 +645,7 @@ void SimProxy::handleCommand(const Command &command) {
         connect(this, &SimProxy::handleRadioCommands, m_sim, &Simulator::handleRadioCommands);
         connect(m_sim, &Simulator::sendSSLSimError, this, &SimProxy::sendSSLSimError);
         connect(m_sim, &Simulator::sendRadioResponses, this, &SimProxy::sendRadioResponses);
+        connect(m_sim, &Simulator::sendGroundTruth, this, &SimProxy::sendGroundTruth);
         auto* simCommand = m_teamCommand->mutable_simulator();
         simCommand->set_enable(true);
         auto* trCommand = m_teamCommand->mutable_transceiver();
@@ -645,6 +654,488 @@ void SimProxy::handleCommand(const Command &command) {
     }
     emit gotCommand(command);
 }
+
+class IbisCommandAdaptor : public QObject {
+    Q_OBJECT
+public:
+    IbisCommandAdaptor(int port, Timer* timer, double accSpeedup, double accBrake)
+        : m_server(this)
+        , m_timer(timer)
+        , m_accSpeedup(accSpeedup)
+        , m_accBrake(accBrake)
+    {
+        m_server.bind(QHostAddress::Any, static_cast<quint16>(port));
+        connect(&m_server, &QUdpSocket::readyRead, this, &IbisCommandAdaptor::handleDatagrams);
+    }
+
+public slots:
+    void handleVisionData(const QByteArray& data, qint64, QString) {
+        SSL_WrapperPacket pkt;
+        if (!pkt.ParseFromArray(data.data(), data.size()) || !pkt.has_detection()) {
+            return;
+        }
+        const auto& det = pkt.detection();
+        for (const auto& r : det.robots_blue()) {
+            if (r.has_robot_id() && r.has_orientation()) {
+                const uint32_t id = r.robot_id();
+                if (id < kMaxRobots) {
+                    m_vision[0][id] = {r.x(), r.y(), r.orientation(), true};
+                }
+            }
+        }
+        for (const auto& r : det.robots_yellow()) {
+            if (r.has_robot_id() && r.has_orientation()) {
+                const uint32_t id = r.robot_id();
+                if (id < kMaxRobots) {
+                    m_vision[1][id] = {r.x(), r.y(), r.orientation(), true};
+                }
+            }
+        }
+    }
+
+signals:
+    void sendRadioCommands(const SSLSimRobotControl& commands, bool isBlue, qint64 processingDelay);
+
+private slots:
+    void handleDatagrams() {
+        while (m_server.hasPendingDatagrams()) {
+            const qint64 start = m_timer->currentTime();
+            auto datagram = m_server.receiveDatagram();
+            const auto& data = datagram.data();
+
+            if (data.size() != IBIS_PACKET_SIZE) {
+                continue;
+            }
+
+            const uint8_t* buf = reinterpret_cast<const uint8_t*>(data.constData());
+
+            SSLSimRobotControl blueControl{new sslsim::RobotControl};
+            SSLSimRobotControl yellowControl{new sslsim::RobotControl};
+            bool hasBlue = false, hasYellow = false;
+
+            for (int slot = 0; slot < IBIS_ROBOT_SLOTS; ++slot) {
+                const int offset = slot * IBIS_SLOT_SIZE;
+                const uint8_t robot_id = buf[offset];
+                if (robot_id >= IBIS_ROBOT_SLOTS) {
+                    continue;
+                }
+
+                const uint8_t* cmd_data = buf + offset + 1;
+                // Senders zero-fill the slots of robots they do not control.
+                if (ibisSlotIsEmpty(cmd_data)) {
+                    continue;
+                }
+                if (cmd_data[CHECK_COUNTER] == m_robotStates[robot_id].last_check_counter) {
+                    continue;
+                }
+
+                const IbisCommand cmd = ibisDeserialize(cmd_data);
+                m_robotStates[robot_id].last_check_counter = cmd.check_counter;
+
+                // Team auto-detection: match vision_global_pos against cached positions.
+                // Also keeps the matched vision entry for orientation lookup below.
+                int teamIdx = -1;
+                const IbisVisionState* vis = nullptr;
+                double nearest = -1.0;
+                for (int t = 0; t < 2; ++t) {
+                    const IbisVisionState& v = m_vision[t][robot_id];
+                    if (!v.valid) { continue; }
+                    const float dx = v.x_mm / 1000.0f - cmd.vision_global_pos[0];
+                    const float dy = v.y_mm / 1000.0f - cmd.vision_global_pos[1];
+                    const double dist = std::hypot(dx, dy);
+                    if (nearest < 0.0 || dist < nearest) {
+                        nearest = dist;
+                    }
+                    if (dist < IBIS_POSITION_MATCH_THRESHOLD) {
+                        teamIdx = t;
+                        vis = &v;
+                        break;
+                    }
+                }
+                if (teamIdx < 0) {
+                    warnPositionMismatch(robot_id, cmd, nearest);
+                    continue;
+                }
+                m_robotStates[robot_id].match_warned = false;
+                const bool ibisIsBlue = (teamIdx == 0);
+
+                auto* robotCmd = ibisIsBlue
+                    ? blueControl->add_robot_commands()
+                    : yellowControl->add_robot_commands();
+                robotCmd->set_id(robot_id);
+
+                if (ibisShouldStop(cmd)) {
+                    auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
+                    lv->set_forward(0.0f);
+                    lv->set_left(0.0f);
+                    lv->set_angular(0.0f);
+                    m_robotStates[robot_id].prev_vx = 0.0;
+                    m_robotStates[robot_id].prev_vy = 0.0;
+                } else if (cmd.control_mode != IBIS_MODE_POLAR_VELOCITY_TARGET) {
+                    // This adaptor emulates the robot's STM32 (G474) main board, which
+                    // implements POLAR_VELOCITY_TARGET only. Any other mode means the
+                    // chain is misconfigured -- most likely a POSITION_TARGET command
+                    // that should have been consumed by the robot-side position loop
+                    // (cm4_sim) before reaching the simulator. Hold the robot still and
+                    // say why, rather than steering on reinterpreted mode args.
+                    warnUnsupportedMode(robot_id, cmd.control_mode);
+                    auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
+                    lv->set_forward(0.0f);
+                    lv->set_left(0.0f);
+                    lv->set_angular(0.0f);
+                    m_robotStates[robot_id].prev_vx = 0.0;
+                    m_robotStates[robot_id].prev_vy = 0.0;
+                } else {
+                    const double current_theta = vis->orientation_rad;
+
+                    double theta_error = cmd.target_global_theta - current_theta;
+                    while (theta_error >  M_PI) theta_error -= 2.0 * M_PI;
+                    while (theta_error < -M_PI) theta_error += 2.0 * M_PI;
+
+                    double omega = IBIS_THETA_P_GAIN * theta_error;
+                    omega = std::max(-static_cast<double>(cmd.angular_velocity_limit),
+                                     std::min(omega, static_cast<double>(cmd.angular_velocity_limit)));
+
+                    const double predicted_theta = current_theta + omega * IBIS_DT;
+                    const double vel_angle = cmd.polar_velocity_theta - predicted_theta;
+                    double target_vx = cmd.polar_velocity_r * std::cos(vel_angle);
+                    double target_vy = cmd.polar_velocity_r * std::sin(vel_angle);
+
+                    auto& state = m_robotStates[robot_id];
+                    const double current_speed = std::hypot(state.prev_vx, state.prev_vy);
+                    const double target_speed  = std::hypot(target_vx, target_vy);
+                    double acc_limit = (target_speed < current_speed) ? m_accBrake : m_accSpeedup;
+                    if (cmd.acceleration_limit > 0.0f && cmd.acceleration_limit < static_cast<float>(acc_limit)) {
+                        acc_limit = cmd.acceleration_limit;
+                    }
+
+                    const double delta_vx   = target_vx - state.prev_vx;
+                    const double delta_vy   = target_vy - state.prev_vy;
+                    const double delta_norm = std::hypot(delta_vx, delta_vy);
+                    const double max_delta  = acc_limit * IBIS_DT;
+
+                    double out_vx, out_vy;
+                    if (delta_norm > max_delta && delta_norm > 1e-9) {
+                        out_vx = state.prev_vx + (delta_vx / delta_norm) * max_delta;
+                        out_vy = state.prev_vy + (delta_vy / delta_norm) * max_delta;
+                    } else {
+                        out_vx = target_vx;
+                        out_vy = target_vy;
+                    }
+
+                    const double out_speed = std::hypot(out_vx, out_vy);
+                    if (cmd.linear_velocity_limit > 0.0f && out_speed > cmd.linear_velocity_limit) {
+                        out_vx = out_vx / out_speed * cmd.linear_velocity_limit;
+                        out_vy = out_vy / out_speed * cmd.linear_velocity_limit;
+                    }
+
+                    state.prev_vx = out_vx;
+                    state.prev_vy = out_vy;
+
+                    auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
+                    lv->set_forward(static_cast<float>(out_vx));
+                    lv->set_left(static_cast<float>(out_vy));
+                    lv->set_angular(static_cast<float>(omega));
+
+                    if (cmd.kick_power > 0.001f) {
+                        robotCmd->set_kick_speed(static_cast<float>(IBIS_MAX_KICK_SPEED * cmd.kick_power));
+                        robotCmd->set_kick_angle(cmd.enable_chip ? static_cast<float>(IBIS_CHIP_ANGLE_DEG) : 0.0f);
+                    }
+                    if (cmd.dribble_power > 0.001f) {
+                        // Match Amun's normalized 0..1 dribbler command conversion.
+                        constexpr float kMaxDribblerSpeedRpm = static_cast<float>(150.0 * 60.0 * 0.5 / M_PI);
+                        robotCmd->set_dribbler_speed(kMaxDribblerSpeedRpm * cmd.dribble_power);
+                    }
+                }
+
+                if (ibisIsBlue) { hasBlue = true; } else { hasYellow = true; }
+            }
+
+            if (hasBlue) {
+                emit sendRadioCommands(blueControl, true, start);
+            }
+            if (hasYellow) {
+                emit sendRadioCommands(yellowControl, false, start);
+            }
+            warnLatency(m_timer->currentTime() - start);
+        }
+    }
+
+private:
+    // Logs at most once per second per robot, so a persistently misconfigured
+    // chain produces a readable hint instead of a flood at the command rate.
+    void warnUnsupportedMode(int robot_id, uint8_t mode) {
+        constexpr qint64 kWarnIntervalNs = 1000LL * 1000LL * 1000LL;
+        auto& state = m_robotStates[robot_id];
+        const qint64 now = m_timer->currentTime();
+        if (state.mode_warned && now - state.last_mode_warn_ns < kWarnIntervalNs) {
+            return;
+        }
+        state.mode_warned = true;
+        state.last_mode_warn_ns = now;
+        if (mode == IBIS_MODE_POSITION_TARGET) {
+            log(stdout,
+                "ibis: robot %d sent POSITION_TARGET (mode %u), robot stopped. The simulator "
+                "emulates the STM32 main board and does not close a position loop -- run the "
+                "CM4 position controller (cm4_sim) between crane and the simulator. "
+                "See docs/robot-side-position-control.md\n",
+                robot_id, static_cast<unsigned>(mode));
+        } else {
+            log(stdout,
+                "ibis: robot %d sent unsupported control mode %u, robot stopped "
+                "(expected POLAR_VELOCITY_TARGET = %u)\n",
+                robot_id, static_cast<unsigned>(mode),
+                static_cast<unsigned>(IBIS_MODE_POLAR_VELOCITY_TARGET));
+        }
+    }
+
+    // The command carries the sender's own estimate of where the robot is
+    // (vision_global_pos). When it does not match any robot on the field the command
+    // is dropped -- silently, until this warning was added. A silent drop is very hard
+    // to tell apart from "the robot is commanded to hold still": the packets keep
+    // arriving, check_counter keeps advancing, and nothing moves. Report the nearest
+    // candidate so the reader can see whether the estimate is merely stale (slightly
+    // over the threshold) or pointing somewhere else entirely.
+    void warnPositionMismatch(int robot_id, const IbisCommand& cmd, double nearest) {
+        constexpr qint64 kWarnIntervalNs = 1000LL * 1000LL * 1000LL;
+        auto& state = m_robotStates[robot_id];
+        const qint64 now = m_timer->currentTime();
+        if (state.match_warned && now - state.last_match_warn_ns < kWarnIntervalNs) {
+            return;
+        }
+        state.match_warned = true;
+        state.last_match_warn_ns = now;
+        if (nearest < 0.0) {
+            log(stdout,
+                "ibis: robot %d command dropped -- no robot with this id is on the field yet "
+                "(command claims the robot is at %.3f, %.3f). Commands are ignored until "
+                "vision reports the robot.\n",
+                robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1]);
+        } else {
+            log(stdout,
+                "ibis: robot %d command dropped -- vision_global_pos (%.3f, %.3f) is %.3f m "
+                "from the robot, over the %.2f m match threshold. The sender's position "
+                "estimate disagrees with the simulator; the robot will not move until they "
+                "agree. See docs/robot-side-position-control.md\n",
+                robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1],
+                nearest, IBIS_POSITION_MATCH_THRESHOLD);
+        }
+    }
+
+    static constexpr uint32_t kMaxRobots = 16;
+
+    struct PerRobotState {
+        double  prev_vx            = 0.0;
+        double  prev_vy            = 0.0;
+        uint8_t last_check_counter = 0xFF;
+        qint64  last_mode_warn_ns  = 0;
+        bool    mode_warned        = false;
+        qint64  last_match_warn_ns = 0;
+        bool    match_warned       = false;
+    };
+
+    // m_vision[0] = blue, m_vision[1] = yellow
+    IbisVisionState m_vision[2][kMaxRobots]  = {};
+    PerRobotState   m_robotStates[IBIS_ROBOT_SLOTS] = {};
+
+    QUdpSocket m_server;
+    Timer*     m_timer;
+    double     m_accSpeedup;
+    double     m_accBrake;
+};
+
+class RefereeTeamDetector : public QObject {
+    Q_OBJECT
+public:
+    RefereeTeamDetector(const QString& teamName, bool localhost, quint16 port = SSL_GAME_CONTROLLER_PORT)
+        : m_socket(this)
+        , m_teamName(teamName.toLower().trimmed())
+    {
+        m_socket.bind(QHostAddress::AnyIPv4,
+                      port,
+                      QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
+        if (!localhost) {
+            m_socket.joinMulticastGroup(QHostAddress(SSL_GAME_CONTROLLER_ADDRESS));
+        }
+        connect(&m_socket, &QUdpSocket::readyRead, this, &RefereeTeamDetector::handleDatagrams);
+    }
+
+signals:
+    void teamDetected(bool ibisIsBlue);
+
+private slots:
+    void handleDatagrams() {
+        while (m_socket.hasPendingDatagrams()) {
+            auto datagram = m_socket.receiveDatagram();
+            SSL_Referee ref;
+            if (!ref.ParseFromArray(datagram.data().data(), datagram.data().size())) {
+                continue;
+            }
+            auto tryMatch = [&](const SSL_Referee::TeamInfo& info, bool isBlue) {
+                if (!info.has_name()) { return false; }
+                if (QString::fromStdString(info.name()).toLower().trimmed() != m_teamName) { return false; }
+                disconnect(&m_socket, &QUdpSocket::readyRead, this, &RefereeTeamDetector::handleDatagrams);
+                emit teamDetected(isBlue);
+                return true;
+            };
+            if (ref.has_blue()   && tryMatch(ref.blue(),   true))  { return; }
+            if (ref.has_yellow() && tryMatch(ref.yellow(), false)) { return; }
+        }
+    }
+
+private:
+    QUdpSocket m_socket;
+    QString    m_teamName;
+};
+
+class IbisFeedbackAdaptor : public QObject {
+    Q_OBJECT
+public:
+    // explicitColorSet: --ibis-team-color was given, so the colour is known up
+    // front and the referee (if also enabled) may only correct it later.
+    IbisFeedbackAdaptor(const QHostAddress& addr, quint16 portBase, bool useReferee,
+                        bool explicitColorSet, bool explicitIsBlue)
+        : m_sender(new PacketSenderThread())
+        , m_addr(addr)
+        , m_portBase(portBase)
+        , m_ibisIsBlue(explicitColorSet ? explicitIsBlue : true)
+        , m_refereeResolved(explicitColorSet || !useReferee)
+    {}
+
+    ~IbisFeedbackAdaptor() override {
+        m_sender->stop();
+        m_sender->wait();
+        delete m_sender;
+    }
+
+public slots:
+    // world::SimulatorState を受け取るたびに IbisVisionState を更新し、そのループの feedback を送信する（125Hz）
+    // world::SimRobot の座標系: p_x/p_y はゲーム座標系のメートル単位（Bullet座標 / SIMULATOR_SCALE）
+    // SSL座標系への変換: x_mm = p_y * 1000, y_mm = -p_x * 1000
+    // 方向角: クォータニオン (i,j,k,real) の回転行列第1列から yaw を算出
+    void handleGroundTruth(const QByteArray& data) {
+        world::SimulatorState state;
+        if (!state.ParseFromArray(data.data(), data.size())) {
+            return;
+        }
+        auto updateTeam = [this](const auto& robots, int teamIdx) {
+            for (const auto& r : robots) {
+                const uint32_t id = r.id();
+                if (id >= kMaxRobots) { continue; }
+                const float qx = r.rotation().i();
+                const float qy = r.rotation().j();
+                const float qz = r.rotation().k();
+                const float qw = r.rotation().real();
+                const float dir_x = 1.0f - 2.0f * (qy*qy + qz*qz);
+                const float dir_y = 2.0f * (qx*qy + qw*qz);
+                m_vision[teamIdx][id] = {
+                    r.p_y() * 1000.0f,
+                    -r.p_x() * 1000.0f,
+                    std::atan2(dir_y, dir_x),
+                    true
+                };
+            }
+        };
+        updateTeam(state.blue_robots(),   0);
+        updateTeam(state.yellow_robots(), 1);
+        if (!m_refereeResolved) {
+            // No feedback at all goes out until the colour is known. Say so:
+            // a controller that closes its position loop on this feedback has
+            // no position signal while this message is printing.
+            if (++m_waitLogCount % 200 == 0) {
+                log(stdout,
+                    "ibis: NO FEEDBACK IS BEING SENT -- still waiting for the Game Controller "
+                    "to identify team color. If the referee does not carry the team name, "
+                    "pass --ibis-team-color blue|yellow instead of --ibis-use-referee.\n");
+            }
+            return;
+        }
+
+        const int teamIdx = m_ibisIsBlue ? 0 : 1;
+        for (uint32_t id = 0; id < kMaxRobots; ++id) {
+            const IbisVisionState& vis = m_vision[teamIdx][id];
+            if (!vis.valid) { continue; }
+
+            uint8_t buffer[IBIS_FEEDBACK_SIZE];
+            ibisBuildFeedbackPacket(
+                buffer,
+                // Byte 3 echoes the AI command check counter on real hardware.
+                // This adaptor does not see the command stream, so it sends a
+                // free-running counter instead -- still usable for staleness
+                // detection, but it does not correlate with a specific command.
+                m_counters[id]++,
+                m_txCycles[id]++,
+                vis.orientation_rad,
+                m_robotCache[id].ball_detected,
+                0, // kick_status not tracked in ER-Force simulator
+                vis.x_mm / 1000.0f,
+                vis.y_mm / 1000.0f,
+                m_robotCache[id].vel_x,
+                m_robotCache[id].vel_y);
+
+            m_sender->enqueue(
+                QByteArray(reinterpret_cast<const char*>(buffer), IBIS_FEEDBACK_SIZE),
+                m_addr,
+                m_portBase + static_cast<quint16>(id));
+        }
+    }
+
+    void handleRobotResponse(const QList<robot::RadioResponse>& responses) {
+        if (!m_refereeResolved) {
+            return;
+        }
+
+        const int teamIdx = m_ibisIsBlue ? 0 : 1;
+        for (const auto& resp : responses) {
+            if (!resp.has_is_blue() || resp.is_blue() != m_ibisIsBlue) { continue; }
+            if (!resp.has_estimated_speed()) { continue; }
+            const uint32_t id = resp.id();
+            if (id >= kMaxRobots) { continue; }
+
+            const IbisVisionState& vis = m_vision[teamIdx][id];
+            if (!vis.valid) { continue; }
+
+            // ロボットローカル速度（v_f=前方, v_s=左）をグローバルSSL座標に変換してキャッシュ
+            const float theta = vis.orientation_rad;
+            const float v_f = resp.estimated_speed().v_f();
+            const float v_s = resp.estimated_speed().v_s();
+            m_robotCache[id].vel_x = v_f * std::cos(theta) - v_s * std::sin(theta);
+            m_robotCache[id].vel_y = v_f * std::sin(theta) + v_s * std::cos(theta);
+            m_robotCache[id].ball_detected = resp.has_ball_detected() && resp.ball_detected();
+        }
+    }
+
+    void handleRefereePacket(bool ibisIsBlue) {
+        m_ibisIsBlue = ibisIsBlue;
+        if (!m_refereeResolved) {
+            m_refereeResolved = true;
+            log(stdout, "ibis: team color resolved to %s from Game Controller\n",
+                ibisIsBlue ? "BLUE" : "YELLOW");
+        }
+    }
+
+private:
+    static constexpr uint32_t kMaxRobots = 16;
+
+    struct RobotCache {
+        float vel_x = 0.0f;
+        float vel_y = 0.0f;
+        bool ball_detected = false;
+    };
+
+    // m_vision[0] = blue, m_vision[1] = yellow
+    IbisVisionState m_vision[2][kMaxRobots] = {};
+    RobotCache      m_robotCache[kMaxRobots] = {};
+    uint8_t         m_counters[kMaxRobots]  = {};
+    uint8_t         m_txCycles[kMaxRobots]  = {};
+    int             m_waitLogCount          = 0;
+
+    PacketSenderThread* m_sender;
+    QHostAddress        m_addr;
+    quint16             m_portBase;
+    bool                m_ibisIsBlue;
+    bool                m_refereeResolved;
+};
 
 #include "simulator.moc"
 
@@ -671,11 +1162,31 @@ int main(int argc, char* argv[])
     parser.addHelpOption();
 
     QCommandLineOption geometryConfig({"g", "geometry"}, "The geometry file to load as default", "file", "2020");
-    QCommandLineOption realismConfig("realism", "Simulator realism configuration (short file name without the .txt)", "realism", "Realistic");
+    QCommandLineOption realismConfig("realism", "Simulator realism configuration (short file name without the .txt)", "realism", "Ibis");
     QCommandLineOption localhostConfig("localhost", "Use localhost as the output address for the simulator");
     parser.addOption(geometryConfig);
     parser.addOption(realismConfig);
     parser.addOption(localhostConfig);
+
+    // ibis binary protocol options (always enabled on the ibis branch)
+    QCommandLineOption ibisPortOpt("ibis-port", "ibis command receiver UDP port", "port", QString::number(IBIS_DEFAULT_PORT));
+    QCommandLineOption ibisFeedbackAddrOpt("ibis-feedback-addr", "ibis feedback destination address", "addr", "127.0.0.1");
+    QCommandLineOption ibisFeedbackPortBaseOpt("ibis-feedback-port-base", "ibis feedback base port (robotId is added)", "port", QString::number(IBIS_FEEDBACK_PORT_BASE));
+    QCommandLineOption ibisFeedbackTeamNameOpt("ibis-feedback-team-name", "Team name to look up in Game Controller for color detection", "name", "ibis");
+    QCommandLineOption ibisUseRefereeOpt("ibis-use-referee", "Use Game Controller referee to auto-detect ibis team color");
+    QCommandLineOption ibisTeamColorOpt("ibis-team-color", "Set the ibis team color explicitly (blue|yellow), instead of detecting it from the Game Controller", "color", "");
+    QCommandLineOption ibisAccSpeedupOpt("ibis-acc-speedup", "Acceleration limit for speedup [m/s^2]", "accel", "4.0");
+    QCommandLineOption ibisAccBrakeOpt("ibis-acc-brake", "Acceleration limit for braking [m/s^2]", "accel", "6.0");
+    QCommandLineOption ibisRefereePortOpt("ibis-referee-port", "Game Controller multicast port for team color detection", "port", QString::number(SSL_GAME_CONTROLLER_PORT));
+    parser.addOption(ibisPortOpt);
+    parser.addOption(ibisFeedbackAddrOpt);
+    parser.addOption(ibisFeedbackPortBaseOpt);
+    parser.addOption(ibisFeedbackTeamNameOpt);
+    parser.addOption(ibisUseRefereeOpt);
+    parser.addOption(ibisTeamColorOpt);
+    parser.addOption(ibisAccSpeedupOpt);
+    parser.addOption(ibisAccBrakeOpt);
+    parser.addOption(ibisRefereePortOpt);
 
     parser.process(app);
 
@@ -748,6 +1259,83 @@ int main(int argc, char* argv[])
     vision.moveToThread(&rcv_thread);
     commands.moveToThread(&rcv_thread);
 
+    // ibis binary protocol components (always enabled on the ibis branch)
+    {
+        const int cmdPort           = parser.value(ibisPortOpt).toInt();
+        const double accSpeedup     = parser.value(ibisAccSpeedupOpt).toDouble();
+        const double accBrake       = parser.value(ibisAccBrakeOpt).toDouble();
+        const QHostAddress fbAddr   = QHostAddress(parser.value(ibisFeedbackAddrOpt));
+        const quint16 fbPortBase    = static_cast<quint16>(parser.value(ibisFeedbackPortBaseOpt).toUInt());
+        const bool useReferee       = parser.isSet(ibisUseRefereeOpt);
+
+        // Team colour selects which team's ground truth the feedback carries.
+        // Getting it wrong is silent and nasty: the feedback still flows, but
+        // it describes the opponent's robots, so anything closing a position
+        // loop on it steers on the wrong positions.
+        const QString teamColorStr = parser.value(ibisTeamColorOpt).trimmed().toLower();
+        bool explicitColorSet = false;
+        bool explicitIsBlue   = true;
+        if (!teamColorStr.isEmpty()) {
+            if (teamColorStr == "blue") {
+                explicitColorSet = true; explicitIsBlue = true;
+            } else if (teamColorStr == "yellow") {
+                explicitColorSet = true; explicitIsBlue = false;
+            } else {
+                log(stdout, "ibis: unknown --ibis-team-color '%s', expected blue or yellow\n",
+                    teamColorStr.toStdString().c_str());
+                return 1;
+            }
+        }
+        if (explicitColorSet) {
+            log(stdout, "ibis: team color set to %s by --ibis-team-color\n",
+                explicitIsBlue ? "BLUE" : "YELLOW");
+        } else if (useReferee) {
+            log(stdout, "ibis: team color will be detected from the Game Controller "
+                        "(team name '%s'); no feedback is sent until it resolves\n",
+                parser.value(ibisFeedbackTeamNameOpt).toStdString().c_str());
+        } else {
+            log(stdout, "ibis: WARNING no team color given and referee detection is off -- "
+                        "assuming BLUE. If ibis plays yellow, the feedback will carry the "
+                        "opponent's positions. Pass --ibis-team-color blue|yellow.\n");
+        }
+        const quint16 refereePort   = static_cast<quint16>(parser.value(ibisRefereePortOpt).toUInt());
+
+        auto* ibisCmd = new IbisCommandAdaptor(cmdPort, &timer, accSpeedup, accBrake);
+        auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee,
+                                               explicitColorSet, explicitIsBlue);
+
+        // IbisCommandAdaptor receives vision data to cache robot positions/orientations
+        QObject::connect(&sim, &SimProxy::gotPacket,
+                         ibisCmd, &IbisCommandAdaptor::handleVisionData);
+        // IbisCommandAdaptor sends converted commands to the simulator
+        QObject::connect(ibisCmd, &IbisCommandAdaptor::sendRadioCommands,
+                         &sim, &SimProxy::handleRadioCommands);
+
+        // IbisFeedbackAdaptor receives ground truth positions at 125Hz and emits one feedback packet per loop
+        QObject::connect(&sim, &SimProxy::sendGroundTruth,
+                         ibisFb, &IbisFeedbackAdaptor::handleGroundTruth);
+        // IbisFeedbackAdaptor receives radio responses for velocity and ball detection
+        QObject::connect(&sim, &SimProxy::sendRadioResponses,
+                         ibisFb, &IbisFeedbackAdaptor::handleRobotResponse);
+
+        if (useReferee) {
+            auto* referee = new RefereeTeamDetector(
+                parser.value(ibisFeedbackTeamNameOpt),
+                parser.isSet(localhostConfig),
+                refereePort);
+            QObject::connect(referee, &RefereeTeamDetector::teamDetected,
+                             ibisFb, &IbisFeedbackAdaptor::handleRefereePacket);
+            referee->moveToThread(&rcv_thread);
+        }
+
+        ibisCmd->moveToThread(&rcv_thread);
+        ibisFb->moveToThread(&rcv_thread);
+
+        log(stdout, "ibis: command receiver on UDP port %d\n", cmdPort);
+        log(stdout, "ibis: feedback sender to %s base port %d synchronized to simulator loop (125 Hz)\n",
+            parser.value(ibisFeedbackAddrOpt).toStdString().c_str(),
+            static_cast<int>(fbPortBase));
+    }
 
     rcv_thread.start();
 
