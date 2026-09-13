@@ -30,6 +30,10 @@ constexpr int    IBIS_FEEDBACK_SIZE      = 128;
 constexpr int    IBIS_FEEDBACK_PORT_BASE = 50100;
 constexpr double IBIS_POSITION_MATCH_THRESHOLD = 0.5; // metres
 
+// The real STM32 main board stops the wheels when vision has been lost for
+// longer than this (G474_Orion_main/Core/Src/state_func.c).
+constexpr uint16_t IBIS_VISION_LOST_TIMEOUT_MS = 500;
+
 // Control modes. Must match crane_sender/include/crane_sender/robot_packet.h
 // and Orion_CM4/cm4/bridge/robot_packet.h (ControlMode enum).
 //
@@ -102,6 +106,8 @@ struct IbisCommand {
     float   acceleration_limit;      // m/s^2 (0 means "use default")
     float   linear_velocity_limit;   // m/s   (0 means "no limit")
     float   angular_velocity_limit;  // rad/s
+    uint16_t latency_time_ms;
+    uint16_t elapsed_time_ms_since_last_vision;
     float   polar_velocity_r;        // m/s           (mode 3 args)
     float   polar_velocity_theta;    // radians (global direction, mode 3 args)
     float   terminal_velocity_xy[2]; // m/s           (mode 4 args)
@@ -141,6 +147,11 @@ inline IbisCommand ibisDeserialize(const uint8_t* d)
     cmd.linear_velocity_limit  = ibisDecodeTwoByte(d[LINEAR_VEL_LIMIT_H], d[LINEAR_VEL_LIMIT_L], 32.767f);
     cmd.angular_velocity_limit = ibisDecodeTwoByte(d[ANGULAR_VEL_LIMIT_H], d[ANGULAR_VEL_LIMIT_L], 32.767f);
 
+    // These two are plain uint16 (high, low), not the +/-range float encoding.
+    cmd.latency_time_ms = static_cast<uint16_t>((d[LATENCY_MS_H] << 8) | d[LATENCY_MS_L]);
+    cmd.elapsed_time_ms_since_last_vision =
+        static_cast<uint16_t>((d[ELAPSED_VISION_H] << 8) | d[ELAPSED_VISION_L]);
+
     uint8_t flags = d[FLAGS];
     cmd.is_vision_available = (flags >> IS_VISION_AVAILABLE) & 0x01;
     cmd.enable_chip         = (flags >> ENABLE_CHIP) & 0x01;
@@ -172,6 +183,19 @@ inline IbisCommand ibisDeserialize(const uint8_t* d)
     cmd.terminal_velocity    = ibisDecodeTwoByte(d[TERMINAL_VEL_H], d[TERMINAL_VEL_L], 32.767f);
 
     return cmd;
+}
+
+// Mirrors the wheel-stop condition of the real STM32 main board
+// (G474_Orion_main/Core/Src/state_func.c): it halts the wheels on emergency
+// stop, on vision being unavailable, and on vision having gone stale. The
+// simulator emulates that board, so it must stop for the same reasons --
+// otherwise the robot keeps driving in simulation under conditions that would
+// park it on real hardware, which matters most under injected packet loss.
+inline bool ibisShouldStop(const IbisCommand& cmd)
+{
+    return cmd.stop_emergency
+        || !cmd.is_vision_available
+        || cmd.elapsed_time_ms_since_last_vision > IBIS_VISION_LOST_TIMEOUT_MS;
 }
 
 // True when a robot slot carries no command at all. Senders zero-fill the slots

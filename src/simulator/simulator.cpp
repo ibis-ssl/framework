@@ -757,7 +757,7 @@ private slots:
                     : yellowControl->add_robot_commands();
                 robotCmd->set_id(robot_id);
 
-                if (cmd.stop_emergency) {
+                if (ibisShouldStop(cmd)) {
                     auto* lv = robotCmd->mutable_move_command()->mutable_local_velocity();
                     lv->set_forward(0.0f);
                     lv->set_left(0.0f);
