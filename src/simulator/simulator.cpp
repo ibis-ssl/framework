@@ -1143,16 +1143,20 @@ private:
 
 int main(int argc, char* argv[])
 {
-    // Line-buffer the logs. stdout is block-buffered when it is a pipe or a file --
-    // which is how this runs under Docker, systemd, or a test harness -- and log()
-    // never flushes, so a SIGTERM discards everything written since the last 4 KiB
+    // Line-buffer stdout. It is block-buffered when it is a pipe or a file -- which
+    // is how this runs under Docker, systemd, or a test harness -- and log() never
+    // flushes, so a SIGTERM discards everything written since the last 4 KiB
     // boundary. In practice that means the log is empty exactly when something went
     // wrong and someone goes looking for it: a container stopped after a failed run
     // has produced zero lines here. Do it in the process rather than leaving it to
     // the caller to remember `stdbuf -oL`, which the published image's own entrypoint
     // does not do.
+    //
+    // stderr is deliberately left alone: glibc leaves it unbuffered, which already
+    // survives an abrupt exit. Setting _IOLBF on it would be a weaker guarantee, not
+    // a stronger one -- it would start holding back a write that does not end in a
+    // newline, which is the opposite of what this is for.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
 
     QCoreApplication app(argc, argv);
     app.setApplicationName("Simulator");
