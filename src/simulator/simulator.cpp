@@ -658,17 +658,33 @@ void SimProxy::handleCommand(const Command &command) {
 class IbisCommandAdaptor : public QObject {
     Q_OBJECT
 public:
-    IbisCommandAdaptor(int port, Timer* timer, double accSpeedup, double accBrake)
+    IbisCommandAdaptor(int port, Timer* timer, double accSpeedup, double accBrake,
+                       bool useReferee, bool explicitColorSet, bool explicitIsBlue)
         : m_server(this)
         , m_timer(timer)
         , m_accSpeedup(accSpeedup)
         , m_accBrake(accBrake)
+        , m_ibisIsBlue(explicitColorSet ? explicitIsBlue : true)
+        , m_refereeResolved(explicitColorSet || !useReferee)
     {
         m_server.bind(QHostAddress::Any, static_cast<quint16>(port));
         connect(&m_server, &QUdpSocket::readyRead, this, &IbisCommandAdaptor::handleDatagrams);
     }
 
 public slots:
+    void handleRefereePacket(bool ibisIsBlue) {
+        if (!m_refereeResolved) {
+            m_ibisIsBlue = ibisIsBlue;
+            m_refereeResolved = true;
+            log(stdout, "ibis: command receiver team color resolved to %s from Game Controller\n",
+                ibisIsBlue ? "BLUE" : "YELLOW");
+        } else if (m_ibisIsBlue != ibisIsBlue) {
+            m_ibisIsBlue = ibisIsBlue;
+            log(stdout, "ibis: command receiver team color switched to %s from Game Controller\n",
+                ibisIsBlue ? "BLUE" : "YELLOW");
+        }
+    }
+
     void handleVisionData(const QByteArray& data, qint64, QString) {
         SSL_WrapperPacket pkt;
         if (!pkt.ParseFromArray(data.data(), data.size()) || !pkt.has_detection()) {
@@ -704,6 +720,13 @@ private slots:
             const auto& data = datagram.data();
 
             if (data.size() != IBIS_PACKET_SIZE) {
+                log(stdout, "ibis: received packet of size %d, expected %d\n",
+                    static_cast<int>(data.size()), IBIS_PACKET_SIZE);
+                continue;
+            }
+
+            if (!m_refereeResolved) {
+                // Wait until team color is known from Game Controller
                 continue;
             }
 
@@ -711,11 +734,12 @@ private slots:
 
             SSLSimRobotControl blueControl{new sslsim::RobotControl};
             SSLSimRobotControl yellowControl{new sslsim::RobotControl};
-            bool hasBlue = false, hasYellow = false;
+            bool hasBlue   = false;
+            bool hasYellow = false;
 
             for (int slot = 0; slot < IBIS_ROBOT_SLOTS; ++slot) {
                 const int offset = slot * IBIS_SLOT_SIZE;
-                const uint8_t robot_id = buf[offset];
+                const int robot_id = buf[offset];
                 if (robot_id >= IBIS_ROBOT_SLOTS) {
                     continue;
                 }
@@ -732,32 +756,27 @@ private slots:
                 const IbisCommand cmd = ibisDeserialize(cmd_data);
                 m_robotStates[robot_id].last_check_counter = cmd.check_counter;
 
-                // Team auto-detection: match vision_global_pos against cached positions.
-                // Also keeps the matched vision entry for orientation lookup below.
-                int teamIdx = -1;
+                // Match vision_global_pos against the designated team only.
+                // Do not search opponent team to prevent accidental control of opponent robots.
+                const int teamIdx = m_ibisIsBlue ? 0 : 1;
                 const IbisVisionState* vis = nullptr;
                 double nearest = -1.0;
-                for (int t = 0; t < 2; ++t) {
-                    const IbisVisionState& v = m_vision[t][robot_id];
-                    if (!v.valid) { continue; }
+                const IbisVisionState& v = m_vision[teamIdx][robot_id];
+                if (v.valid) {
                     const float dx = v.x_mm / 1000.0f - cmd.vision_global_pos[0];
                     const float dy = v.y_mm / 1000.0f - cmd.vision_global_pos[1];
                     const double dist = std::hypot(dx, dy);
-                    if (nearest < 0.0 || dist < nearest) {
-                        nearest = dist;
-                    }
+                    nearest = dist;
                     if (dist < IBIS_POSITION_MATCH_THRESHOLD) {
-                        teamIdx = t;
                         vis = &v;
-                        break;
                     }
                 }
-                if (teamIdx < 0) {
+                if (!vis) {
                     warnPositionMismatch(robot_id, cmd, nearest);
                     continue;
                 }
                 m_robotStates[robot_id].match_warned = false;
-                const bool ibisIsBlue = (teamIdx == 0);
+                const bool ibisIsBlue = m_ibisIsBlue;
 
                 auto* robotCmd = ibisIsBlue
                     ? blueControl->add_robot_commands()
@@ -913,20 +932,21 @@ private:
         }
         state.match_warned = true;
         state.last_match_warn_ns = now;
+        const char* teamStr = m_ibisIsBlue ? "BLUE" : "YELLOW";
         if (nearest < 0.0) {
             log(stdout,
-                "ibis: robot %d command dropped -- no robot with this id is on the field yet "
+                "ibis: robot %d command dropped -- no %s robot with this id is on the field yet "
                 "(command claims the robot is at %.3f, %.3f). Commands are ignored until "
                 "vision reports the robot.\n",
-                robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1]);
+                robot_id, teamStr, cmd.vision_global_pos[0], cmd.vision_global_pos[1]);
         } else {
             log(stdout,
                 "ibis: robot %d command dropped -- vision_global_pos (%.3f, %.3f) is %.3f m "
-                "from the robot, over the %.2f m match threshold. The sender's position "
+                "from the %s robot, over the %.2f m match threshold. The sender's position "
                 "estimate disagrees with the simulator; the robot coasts to a stop and "
                 "stays there until they agree. See docs/robot-side-position-control.md\n",
                 robot_id, cmd.vision_global_pos[0], cmd.vision_global_pos[1],
-                nearest, IBIS_POSITION_MATCH_THRESHOLD);
+                nearest, teamStr, IBIS_POSITION_MATCH_THRESHOLD);
         }
     }
 
@@ -950,6 +970,8 @@ private:
     Timer*     m_timer;
     double     m_accSpeedup;
     double     m_accBrake;
+    bool       m_ibisIsBlue      = true;
+    bool       m_refereeResolved = true;
 };
 
 class RefereeTeamDetector : public QObject {
@@ -982,18 +1004,23 @@ private slots:
             auto tryMatch = [&](const SSL_Referee::TeamInfo& info, bool isBlue) {
                 if (!info.has_name()) { return false; }
                 if (QString::fromStdString(info.name()).toLower().trimmed() != m_teamName) { return false; }
-                disconnect(&m_socket, &QUdpSocket::readyRead, this, &RefereeTeamDetector::handleDatagrams);
-                emit teamDetected(isBlue);
+                if (!m_hasDetected || m_lastIsBlue != isBlue) {
+                    m_hasDetected = true;
+                    m_lastIsBlue  = isBlue;
+                    emit teamDetected(isBlue);
+                }
                 return true;
             };
-            if (ref.has_blue()   && tryMatch(ref.blue(),   true))  { return; }
-            if (ref.has_yellow() && tryMatch(ref.yellow(), false)) { return; }
+            if (ref.has_blue()   && tryMatch(ref.blue(),   true))  { continue; }
+            if (ref.has_yellow() && tryMatch(ref.yellow(), false)) { continue; }
         }
     }
 
 private:
     QUdpSocket m_socket;
     QString    m_teamName;
+    bool       m_hasDetected = false;
+    bool       m_lastIsBlue  = false;
 };
 
 class IbisFeedbackAdaptor : public QObject {
@@ -1114,10 +1141,14 @@ public slots:
     }
 
     void handleRefereePacket(bool ibisIsBlue) {
-        m_ibisIsBlue = ibisIsBlue;
         if (!m_refereeResolved) {
+            m_ibisIsBlue = ibisIsBlue;
             m_refereeResolved = true;
-            log(stdout, "ibis: team color resolved to %s from Game Controller\n",
+            log(stdout, "ibis: feedback sender team color resolved to %s from Game Controller\n",
+                ibisIsBlue ? "BLUE" : "YELLOW");
+        } else if (m_ibisIsBlue != ibisIsBlue) {
+            m_ibisIsBlue = ibisIsBlue;
+            log(stdout, "ibis: feedback sender team color switched to %s from Game Controller\n",
                 ibisIsBlue ? "BLUE" : "YELLOW");
         }
     }
@@ -1323,7 +1354,8 @@ int main(int argc, char* argv[])
         }
         const quint16 refereePort   = static_cast<quint16>(parser.value(ibisRefereePortOpt).toUInt());
 
-        auto* ibisCmd = new IbisCommandAdaptor(cmdPort, &timer, accSpeedup, accBrake);
+        auto* ibisCmd = new IbisCommandAdaptor(cmdPort, &timer, accSpeedup, accBrake,
+                                               useReferee, explicitColorSet, explicitIsBlue);
         auto* ibisFb  = new IbisFeedbackAdaptor(fbAddr, fbPortBase, useReferee,
                                                explicitColorSet, explicitIsBlue);
 
@@ -1348,6 +1380,8 @@ int main(int argc, char* argv[])
                 refereePort);
             QObject::connect(referee, &RefereeTeamDetector::teamDetected,
                              ibisFb, &IbisFeedbackAdaptor::handleRefereePacket);
+            QObject::connect(referee, &RefereeTeamDetector::teamDetected,
+                             ibisCmd, &IbisCommandAdaptor::handleRefereePacket);
             referee->moveToThread(&rcv_thread);
         }
 
